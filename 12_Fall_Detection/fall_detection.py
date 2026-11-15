@@ -24,7 +24,7 @@ import cv2
 import numpy as np
 import requests
 from dotenv import load_dotenv
-from flask import Flask, Response, render_template_string, send_from_directory
+from flask import Flask, Response, render_template_string, send_file
 from ultralytics import YOLO
 
 # 固定從「這個 .py 檔所在資料夾」讀 .env（避免工作目錄不同而讀不到）
@@ -293,17 +293,21 @@ def ensure_line_h264_mp4(video_path: Path) -> Path | None:
   return video_path
 
 
+def line_can_embed_image(url: str | None) -> bool:
+  # LINE 伺服器需能抓圖；catbox 常失敗，telegra.ph / imgbb 較穩
+  if not url:
+    return False
+  u = url.lower()
+  return ('telegra.ph/' in u) or ('i.ibb.co/' in u) or ('ibb.co/' in u)
+
+
 def resolve_image_urls(original_path: Path, preview_path: Path) -> tuple[str | None, str | None]:
-  """
-  照片只走圖床（ImgBB / catbox / 0x0）。
-  不使用 PUBLIC_BASE_URL，避免 cloudflared 造成「有訊息但圖空白」。
-  """
+  """照片走 ImgBB（LINE 氣泡才穩）；不走 cloudflared。"""
   preview_url = upload_image_for_line(preview_path)
   original_url = upload_image_for_line(original_path)
 
   if original_url and preview_url:
     return original_url, preview_url
-  # LINE 允許兩欄填同一個可讀圖片網址（用較小的 preview 當保底）
   if preview_url:
     print('ℹ️ 僅 preview 上傳成功，original/preview 共用同一網址')
     return preview_url, preview_url
@@ -311,41 +315,45 @@ def resolve_image_urls(original_path: Path, preview_path: Path) -> tuple[str | N
     print('ℹ️ 僅 original 上傳成功，original/preview 共用同一網址')
     return original_url, original_url
 
-  print('❌ 所有圖床都失敗；不會使用 cloudflared 當照片網址（LINE 常顯示空白）')
+  print('❌ 照片圖床上傳失敗；請確認 IMGBB_API_KEY')
   return None, None
 
 
-def resolve_video_url(video_path: Path, preview_url: str | None) -> tuple[str | None, str | None]:
+def resolve_video_url(video_path: Path, preview_url: str | None) -> tuple[Path | None, str | None, str | None]:
   """
-  影片：先轉 H.264，再 catbox。
-  回傳 (video_url, preview_url)。若缺預覽圖，會重傳一張。
+  影片給 LINE 氣泡播放：
+  - 檔案本身走 PUBLIC_BASE_URL（cloudflared）
+  - 預覽圖走 ImgBB
+  回傳 (ready_path, video_url, preview_url)
   """
   ready = ensure_line_h264_mp4(video_path)
   if ready is None:
-    return None, preview_url
+    return None, None, preview_url
 
-  uploaded = upload_to_catbox(ready)
-  if not uploaded:
-    tunnel = public_media_url(ready)
-    if tunnel:
-      print(f'🔗 使用隧道影片網址: {tunnel}')
-      uploaded = tunnel
+  video_url = public_media_url(ready)
+  if video_url:
+    print(f'🔗 影片使用 cloudflared 網址: {video_url}')
+  else:
+    print(
+        '⚠️ 未設定 PUBLIC_BASE_URL：無法產生 LINE 影片氣泡。'
+        '請先開 cloudflared 並把 https://... 填進 .env 後重開程式'
+    )
+    return ready, None, preview_url
 
-  if uploaded and not preview_url:
-    # 影片訊息仍需要預覽圖；用同資料夾 preview / original 再試
+  if not preview_url or not line_can_embed_image(preview_url):
     sibling_preview = ready.parent / 'fall_preview.jpg'
     sibling_original = ready.parent / 'fall_original.jpg'
     for candidate in (sibling_preview, sibling_original):
       if candidate.exists():
         preview_url = upload_image_for_line(candidate)
-        if preview_url:
+        if preview_url and line_can_embed_image(preview_url):
           break
 
-  if uploaded and not preview_url:
-    print('⚠️ 有影片網址但缺少預覽圖，LINE 影片訊息無法送出')
-    return None, None
+  if not preview_url or not line_can_embed_image(preview_url):
+    print('⚠️ 影片預覽圖無法用 ImgBB 產生，LINE 影片訊息可能失敗')
+    return ready, video_url, None
 
-  return uploaded, preview_url
+  return ready, video_url, preview_url
 
 
 def send_line_messages(messages: list[dict]) -> bool:
@@ -372,63 +380,13 @@ def send_line_messages(messages: list[dict]) -> bool:
   return False
 
 
-def line_can_embed_image(url: str | None) -> bool:
-  # LINE 伺服器需能抓圖；catbox 常失敗，telegra.ph / imgbb 較穩
-  if not url:
-    return False
-  u = url.lower()
-  return ('telegra.ph/' in u) or ('i.ibb.co/' in u) or ('ibb.co/' in u)
-
-
-def extract_video_stills(video_path: Path, count: int = 2) -> list[Path]:
-  """從跌倒短片抽幾張關鍵影格，改以 ImgBB 圖片訊息顯示（LINE 播不了 catbox 影片）。"""
-  cap = cv2.VideoCapture(str(video_path))
-  if not cap.isOpened():
-    return []
-
-  total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-  frames: list[np.ndarray] = []
-
-  if total > 0:
-    # 取約 1/3、2/3 位置（避開開頭緩衝）
-    positions = sorted(
-        {max(0, min(total - 1, total * (i + 1) // (count + 1))) for i in range(count)}
-    )
-    for pos in positions:
-      cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
-      ok, frame = cap.read()
-      if ok:
-        frames.append(frame)
-  else:
-    all_frames: list[np.ndarray] = []
-    while True:
-      ok, frame = cap.read()
-      if not ok:
-        break
-      all_frames.append(frame)
-    if all_frames:
-      for i in range(count):
-        idx = max(0, min(len(all_frames) - 1, len(all_frames) * (i + 1) // (count + 1)))
-        frames.append(all_frames[idx])
-
-  cap.release()
-
-  out_paths: list[Path] = []
-  for i, frame in enumerate(frames, start=1):
-    out = video_path.parent / f'fall_still_{i}.jpg'
-    save_line_safe_jpeg(frame, out, max_side=1024, max_bytes=900_000)
-    out_paths.append(out)
-  print(f'🎞️ 已從影片抽出 {len(out_paths)} 張關鍵影格')
-  return out_paths
-
-
 def send_fall_alert(
     message_text: str,
     original_path: Path,
     preview_path: Path,
     video_path: Path | None = None,
 ) -> None:
-  """推播文字 + 照片；影片改抽影格上 ImgBB，並附瀏覽器可開的影片連結。"""
+  """推播文字 + ImgBB 照片 + cloudflared 影片氣泡（可點開播放）。"""
   messages: list[dict] = [{'type': 'text', 'text': message_text}]
 
   original_url, preview_url = resolve_image_urls(original_path, preview_path)
@@ -446,37 +404,29 @@ def send_fall_alert(
     else:
       print(
           '⚠️ 照片網址人點得到，但 LINE 氣泡可能顯示空白，'
-          '改只放文字連結（建議設定 IMGBB_API_KEY 或等 Telegraph 成功）'
+          '改只放文字連結（建議設定 IMGBB_API_KEY）'
       )
   else:
     print('⚠️ 無法上傳照片到圖床；照片已保存在本機。建議設定 IMGBB_API_KEY')
 
   if video_path and video_path.exists():
-    # ImgBB 不支援影片；catbox 影片在 LINE 內常「錯誤不明」
-    # 因此：1) 抽影格用 ImgBB 顯示  2) 完整影片改放文字連結（手機瀏覽器開）
-    ready = ensure_line_h264_mp4(video_path) or video_path
-    video_url = upload_to_catbox(ready)
-    if video_url:
-      messages[0]['text'] += (
-          f'\n🎬 完整影片請用瀏覽器開啟（LINE 內嵌影片目前不穩）:\n{video_url}'
+    _ready, video_url, video_preview = resolve_video_url(video_path, preview_url)
+    if video_url and video_preview:
+      messages.append(
+          {
+              'type': 'video',
+              'originalContentUrl': video_url,
+              'previewImageUrl': video_preview,
+          }
       )
-      print(f'🎬 影片改以文字連結發送: {video_url}')
+      messages[0]['text'] += f'\n🎬 影片連結:\n{video_url}'
+      print(f'🎬 將以 LINE 影片氣泡發送: {video_url}')
     else:
-      print(f'⚠️ 影片已保留在本機，但無法上傳。路徑: {video_path}')
-
-    for still in extract_video_stills(ready, count=2):
-      if len(messages) >= 5:
-        break
-      still_url = upload_image_for_line(still)
-      if still_url and line_can_embed_image(still_url):
-        messages.append(
-            {
-                'type': 'image',
-                'originalContentUrl': still_url,
-                'previewImageUrl': still_url,
-            }
-        )
-        print(f'🖼️ 影格已加入 LINE 圖片訊息: {still_url}')
+      print(
+          '⚠️ 無法建立 LINE 影片氣泡。請確認：'
+          '1) cloudflared 有在跑  2) .env 的 PUBLIC_BASE_URL 是最新 https 網址  '
+          '3) 程式已重開讀到新網址'
+      )
 
   if len(messages) > 1:
     for i, msg in enumerate(messages[1:], start=1):
@@ -808,8 +758,7 @@ def generate_frames():
 
 @app.route('/media/<path:subpath>')
 def media_files(subpath: str):
-  """提供 events 內照片/影片給 LINE 下載（需搭配 PUBLIC_BASE_URL）。"""
-  # 只允許讀取 events 目錄，避免任意檔案讀取
+  """提供 events 內影片給 LINE 下載（需搭配 PUBLIC_BASE_URL / cloudflared）。"""
   target = (BASE_DIR / subpath).resolve()
   events_root = (BASE_DIR / 'events').resolve()
   if not str(target).startswith(str(events_root)) or not target.is_file():
@@ -822,13 +771,9 @@ def media_files(subpath: str):
       '.png': 'image/png',
       '.mp4': 'video/mp4',
       '.avi': 'video/x-msvideo',
-  }.get(suffix)
-  return send_from_directory(
-      target.parent,
-      target.name,
-      mimetype=mime,
-      conditional=True,
-  )
+  }.get(suffix, 'application/octet-stream')
+  # conditional=True 支援 Range，較利於 LINE 拉影片
+  return send_file(target, mimetype=mime, conditional=True, as_attachment=False)
 
 
 @app.route('/start_detection')
