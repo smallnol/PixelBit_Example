@@ -88,7 +88,7 @@ def resize_for_line(image: np.ndarray, max_side: int) -> np.ndarray:
   scale = min(max_side / max(h, w), 1.0)
   if scale >= 1.0:
     return image
-  new_size = (int(w * scale), int(h * scale))
+  new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
   return cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
 
 
@@ -99,19 +99,33 @@ def encode_jpeg(image: np.ndarray, quality: int = 85) -> bytes:
   return buf.tobytes()
 
 
+def save_line_safe_jpeg(
+    frame: np.ndarray, path: Path, max_side: int, max_bytes: int = 900_000
+) -> Path:
+  """存成 LINE 較不易失敗的 JPEG（尺寸 + 檔案大小雙重限制）。"""
+  image = resize_for_line(frame, max_side)
+  data = encode_jpeg(image, 85)
+  for quality in range(85, 35, -5):
+    data = encode_jpeg(image, quality)
+    if len(data) <= max_bytes:
+      break
+  path.write_bytes(data)
+  print(f'🖼️ 已存 {path.name}: {path.stat().st_size} bytes, max_side={max_side}')
+  return path
+
+
 def save_line_images(frame: np.ndarray, stem: str, folder: Path) -> tuple[Path, Path]:
   """產出 original（≤1024）與 preview（≤240）兩張 JPEG。"""
-  original = resize_for_line(frame, 1024)
-  preview = resize_for_line(frame, 240)
+  folder.mkdir(parents=True, exist_ok=True)
   original_path = folder / f'{stem}_original.jpg'
   preview_path = folder / f'{stem}_preview.jpg'
-  cv2.imwrite(str(original_path), original, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-  cv2.imwrite(str(preview_path), preview, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+  save_line_safe_jpeg(frame, original_path, max_side=1024, max_bytes=900_000)
+  save_line_safe_jpeg(frame, preview_path, max_side=240, max_bytes=200_000)
   return original_path, preview_path
 
 
 def public_media_url(path: Path) -> str | None:
-  """把本機檔案轉成 LINE 可抓的 HTTPS URL（需設定 PUBLIC_BASE_URL）。"""
+  """把本機檔案轉成 HTTPS URL（需設定 PUBLIC_BASE_URL）。照片請勿依賴此路徑給 LINE。"""
   if not PUBLIC_BASE_URL:
     return None
   try:
@@ -119,6 +133,24 @@ def public_media_url(path: Path) -> str | None:
   except ValueError:
     return None
   return f'{PUBLIC_BASE_URL}/media/{rel}'
+
+
+def url_looks_like_image(url: str) -> bool:
+  """確認網址真的回傳圖片，避免 LINE 收到 HTML/轉址而顯示空白。"""
+  try:
+    res = requests.get(url, timeout=15, stream=True, allow_redirects=True)
+    ctype = (res.headers.get('Content-Type') or '').lower()
+    ok = res.status_code == 200 and ('image/' in ctype or url.lower().endswith(('.jpg', '.jpeg', '.png')))
+    # 讀一點內容確認不是 HTML
+    chunk = next(res.iter_content(64), b'')
+    if chunk.startswith(b'<') or chunk.startswith(b'<!'):
+      ok = False
+    res.close()
+    print(f'🔎 檢查圖片網址: status={res.status_code} type={ctype} ok={ok}')
+    return ok
+  except Exception as e:
+    print(f'🔎 圖片網址檢查失敗: {e}')
+    return False
 
 
 def upload_to_imgbb(image_path: Path) -> str | None:
@@ -134,9 +166,15 @@ def upload_to_imgbb(image_path: Path) -> str | None:
     res = requests.post('https://api.imgbb.com/1/upload', data=payload, timeout=20)
     data = res.json()
     if res.status_code == 200 and data.get('success'):
-      url = data['data']['url']
-      print(f'☁️ ImgBB 上傳成功: {url}')
-      return url
+      # 優先用直連 image.url，較少轉址問題
+      url = (
+          data.get('data', {}).get('image', {}).get('url')
+          or data.get('data', {}).get('url')
+      )
+      if url and url_looks_like_image(url):
+        print(f'☁️ ImgBB 上傳成功: {url}')
+        return url
+      print(f'⚠️ ImgBB 有網址但 LINE 可能讀不到: {url}')
     print(f'❌ ImgBB 上傳失敗: {res.status_code} {res.text[:300]}')
   except Exception as e:
     print(f'❌ ImgBB 上傳例外: {e}')
@@ -144,13 +182,13 @@ def upload_to_imgbb(image_path: Path) -> str | None:
 
 
 def upload_to_catbox(file_path: Path) -> str | None:
-  """匿名上傳到 catbox，取得直連 HTTPS（照片/影片都可用；比 quick tunnel 對 LINE 穩）。"""
+  """匿名上傳到 catbox，取得直連 HTTPS。"""
   try:
     with open(file_path, 'rb') as f:
       res = requests.post(
           'https://catbox.moe/user/api.php',
           data={'reqtype': 'fileupload'},
-          files={'fileToUpload': (file_path.name, f)},
+          files={'fileToUpload': (file_path.name, f, 'application/octet-stream')},
           timeout=120,
       )
     text = (res.text or '').strip()
@@ -163,11 +201,37 @@ def upload_to_catbox(file_path: Path) -> str | None:
   return None
 
 
+def upload_to_0x0(file_path: Path) -> str | None:
+  """備援圖床 0x0.st。"""
+  try:
+    with open(file_path, 'rb') as f:
+      res = requests.post('https://0x0.st', files={'file': (file_path.name, f)}, timeout=60)
+    text = (res.text or '').strip()
+    if res.status_code == 200 and text.startswith('https://'):
+      print(f'☁️ 0x0 上傳成功: {text}')
+      return text
+    print(f'❌ 0x0 上傳失敗: {res.status_code} {text[:300]}')
+  except Exception as e:
+    print(f'❌ 0x0 上傳例外: {e}')
+  return None
+
+
+def upload_image_for_line(image_path: Path) -> str | None:
+  """照片專用：只走圖床，不走 cloudflared（quick tunnel 常被 LINE 擋）。"""
+  for uploader in (upload_to_imgbb, upload_to_catbox, upload_to_0x0):
+    url = uploader(image_path)
+    if not url:
+      continue
+    if uploader is upload_to_imgbb or url_looks_like_image(url):
+      return url
+  return None
+
+
 def ensure_line_h264_mp4(video_path: Path) -> Path | None:
   """LINE 影片較吃 H.264；若系統有 ffmpeg 就轉檔，否則回傳原檔讓後續嘗試。"""
   if video_path is None or not video_path.exists():
     return None
-  if video_path.suffix.lower() != '.mp4' and video_path.suffix.lower() != '.avi':
+  if video_path.suffix.lower() not in ('.mp4', '.avi'):
     return video_path
 
   out_path = video_path.with_name(video_path.stem + '_h264.mp4')
@@ -202,38 +266,23 @@ def ensure_line_h264_mp4(video_path: Path) -> Path | None:
 
 def resolve_image_urls(original_path: Path, preview_path: Path) -> tuple[str | None, str | None]:
   """
-  照片網址優先序：
-  1) ImgBB（若有 key）
-  2) catbox 直連上傳（對 LINE 通常比 cloudflared quick tunnel 穩）
-  3) PUBLIC_BASE_URL 本機隧道
+  照片只走圖床（ImgBB / catbox / 0x0）。
+  不使用 PUBLIC_BASE_URL，避免 cloudflared 造成「有訊息但圖空白」。
   """
-  # 1) ImgBB
-  original_url = upload_to_imgbb(original_path)
-  preview_url = upload_to_imgbb(preview_path)
-  if original_url and preview_url:
-    return original_url, preview_url
-  if preview_url and not original_url:
-    return preview_url, preview_url
-  if original_url and not preview_url:
-    return original_url, original_url
+  preview_url = upload_image_for_line(preview_path)
+  original_url = upload_image_for_line(original_path)
 
-  # 2) catbox
-  original_url = upload_to_catbox(original_path)
-  preview_url = upload_to_catbox(preview_path)
   if original_url and preview_url:
     return original_url, preview_url
-  if original_url:
-    return original_url, original_url
+  # LINE 允許兩欄填同一個可讀圖片網址（用較小的 preview 當保底）
   if preview_url:
+    print('ℹ️ 僅 preview 上傳成功，original/preview 共用同一網址')
     return preview_url, preview_url
+  if original_url:
+    print('ℹ️ 僅 original 上傳成功，original/preview 共用同一網址')
+    return original_url, original_url
 
-  # 3) 本機隧道（cloudflared / ngrok）— 有時 LINE 抓不到
-  original_url = public_media_url(original_path)
-  preview_url = public_media_url(preview_path)
-  if original_url and preview_url:
-    print(f'🔗 使用隧道照片網址: {original_url}')
-    return original_url, preview_url
-
+  print('❌ 所有圖床都失敗；不會使用 cloudflared 當照片網址（LINE 常顯示空白）')
   return None, None
 
 
@@ -245,7 +294,7 @@ def resolve_video_url(video_path: Path, preview_url: str | None) -> str | None:
   if ready is None:
     return None
 
-  uploaded = upload_to_catbox(ready)
+  uploaded = upload_to_catbox(ready) or upload_to_0x0(ready)
   if uploaded:
     return uploaded
 
@@ -297,11 +346,10 @@ def send_fall_alert(
             'previewImageUrl': preview_url,
         }
     )
+    # 保底：文字裡也放照片連結，圖訊息若仍空白可點開
+    messages[0]['text'] = message_text + f'\n\n📷 照片連結:\n{original_url}'
   else:
-    print(
-        '⚠️ 無法產生照片公開網址。請設定 PUBLIC_BASE_URL（cloudflared/ngrok）'
-        ' 或 IMGBB_API_KEY；照片已保存在本機。'
-    )
+    print('⚠️ 無法上傳照片到圖床；照片已保存在本機。建議設定 IMGBB_API_KEY')
 
   if video_path and video_path.exists():
     video_url = resolve_video_url(video_path, preview_url)
