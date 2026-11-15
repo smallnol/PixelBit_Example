@@ -136,18 +136,18 @@ def public_media_url(path: Path) -> str | None:
 
 
 def is_direct_https_media_url(url: str) -> bool:
-  """上傳成功回傳的直連網址即可採用；不再強制二次下載驗證（Pi 常被圖床斷線誤判）。"""
+  """上傳成功回傳的直連網址即可採用。"""
   if not url or not url.startswith('https://'):
     return False
   lower = url.lower()
-  # catbox / imgbb / 常見圖床
   if any(
       host in lower
       for host in (
-          'files.catbox.moe/',
-          'litter.catbox.moe/',
+          'telegra.ph/',
           'i.ibb.co/',
           'ibb.co/',
+          'files.catbox.moe/',
+          'litter.catbox.moe/',
           '0x0.st/',
       )
   ):
@@ -156,7 +156,7 @@ def is_direct_https_media_url(url: str) -> bool:
 
 
 def upload_to_imgbb(image_path: Path) -> str | None:
-  """ImgBB 上傳照片（需 API key）。"""
+  """ImgBB 上傳照片（需 API key）— 對 LINE 顯示通常最穩。"""
   if not IMGBB_API_KEY:
     return None
   try:
@@ -173,7 +173,7 @@ def upload_to_imgbb(image_path: Path) -> str | None:
           or data.get('data', {}).get('display_url')
           or data.get('data', {}).get('url')
       )
-      if url and is_direct_https_media_url(url):
+      if url and url.startswith('https://'):
         print(f'☁️ ImgBB 上傳成功: {url}')
         return url
       print(f'⚠️ ImgBB 回傳網址不可用: {url}')
@@ -183,8 +183,33 @@ def upload_to_imgbb(image_path: Path) -> str | None:
   return None
 
 
+def upload_to_telegraph(image_path: Path) -> str | None:
+  """
+  Telegram Telegraph 圖床（免 API key）。
+  人用瀏覽器看 catbox 沒問題，但 LINE 伺服器常抓不到 catbox；
+  telegra.ph 對 LINE 圖片訊息通常較可用。
+  """
+  try:
+    with open(image_path, 'rb') as f:
+      res = requests.post(
+          'https://telegra.ph/upload',
+          files={'file': ('image.jpg', f, 'image/jpeg')},
+          timeout=30,
+      )
+    data = res.json()
+    if isinstance(data, list) and data and isinstance(data[0], dict) and data[0].get('src'):
+      src = data[0]['src']
+      url = src if src.startswith('http') else f'https://telegra.ph{src}'
+      print(f'☁️ Telegraph 上傳成功: {url}')
+      return url
+    print(f'❌ Telegraph 上傳失敗: {res.status_code} {str(data)[:300]}')
+  except Exception as e:
+    print(f'❌ Telegraph 上傳例外: {e}')
+  return None
+
+
 def upload_to_catbox(file_path: Path) -> str | None:
-  """匿名上傳到 catbox，取得直連 HTTPS。"""
+  """匿名上傳到 catbox（適合影片；照片給 LINE 常顯示空白，僅作備援）。"""
   try:
     with open(file_path, 'rb') as f:
       res = requests.post(
@@ -203,27 +228,22 @@ def upload_to_catbox(file_path: Path) -> str | None:
   return None
 
 
-def upload_to_0x0(file_path: Path) -> str | None:
-  """備援圖床 0x0.st（目前常關閉，失敗可忽略）。"""
-  try:
-    with open(file_path, 'rb') as f:
-      res = requests.post('https://0x0.st', files={'file': (file_path.name, f)}, timeout=60)
-    text = (res.text or '').strip()
-    if res.status_code == 200 and text.startswith('https://'):
-      print(f'☁️ 0x0 上傳成功: {text}')
-      return text
-    print(f'❌ 0x0 上傳失敗: {res.status_code} {text[:300]}')
-  except Exception as e:
-    print(f'❌ 0x0 上傳例外: {e}')
-  return None
-
-
 def upload_image_for_line(image_path: Path) -> str | None:
-  """照片專用：只走圖床，不走 cloudflared（quick tunnel 常被 LINE 擋）。"""
-  for uploader in (upload_to_imgbb, upload_to_catbox, upload_to_0x0):
+  """
+  照片給 LINE 官方帳號顯示用：
+  優先 ImgBB / Telegraph（LINE 伺服器較讀得到）
+  catbox 人點連結看得到，但 LINE 氣泡常空白，故放最後且會警告。
+  """
+  for uploader in (upload_to_imgbb, upload_to_telegraph):
     url = uploader(image_path)
     if url and is_direct_https_media_url(url):
       return url
+
+  # 最後才 catbox：文字連結可用，image message 可能仍空白
+  url = upload_to_catbox(image_path)
+  if url:
+    print('⚠️ catbox 照片網址已取得，但 LINE 圖片氣泡可能仍無法顯示；建議設定 IMGBB_API_KEY')
+    return url
   return None
 
 
@@ -352,23 +372,36 @@ def send_fall_alert(
   """推播文字 + 照片；若有公開 HTTPS 網址再附影片。"""
   messages: list[dict] = [{'type': 'text', 'text': message_text}]
 
+  def line_can_embed_image(url: str | None) -> bool:
+    # LINE 伺服器需能抓圖；catbox 常失敗，telegra.ph / imgbb 較穩
+    if not url:
+      return False
+    u = url.lower()
+    return ('telegra.ph/' in u) or ('i.ibb.co/' in u) or ('ibb.co/' in u)
+
   original_url, preview_url = resolve_image_urls(original_path, preview_path)
   if original_url and preview_url:
-    messages.append(
-        {
-            'type': 'image',
-            'originalContentUrl': original_url,
-            'previewImageUrl': preview_url,
-        }
-    )
-    # 保底：文字裡也放照片連結，圖訊息若仍空白可點開
     messages[0]['text'] = message_text + f'\n\n📷 照片連結:\n{original_url}'
+    if line_can_embed_image(original_url) and line_can_embed_image(preview_url):
+      messages.append(
+          {
+              'type': 'image',
+              'originalContentUrl': original_url,
+              'previewImageUrl': preview_url,
+          }
+      )
+      print(f'🖼️ 將以 LINE 圖片訊息發送: {original_url}')
+    else:
+      print(
+          '⚠️ 照片網址人點得到，但 LINE 氣泡可能顯示空白，'
+          '改只放文字連結（建議設定 IMGBB_API_KEY 或等 Telegraph 成功）'
+      )
   else:
     print('⚠️ 無法上傳照片到圖床；照片已保存在本機。建議設定 IMGBB_API_KEY')
 
   if video_path and video_path.exists():
     video_url, preview_url = resolve_video_url(video_path, preview_url)
-    if video_url and preview_url:
+    if video_url and preview_url and line_can_embed_image(preview_url):
       messages.append(
           {
               'type': 'video',
@@ -377,6 +410,11 @@ def send_fall_alert(
           }
       )
       print(f'🎬 將附帶跌倒影片: {video_url}')
+      messages[0]['text'] += f'\n🎬 影片連結:\n{video_url}'
+    elif video_url:
+      # 預覽圖若 LINE 讀不到，影片氣泡也常是灰的；改放文字連結較清楚
+      messages[0]['text'] += f'\n🎬 影片連結:\n{video_url}'
+      print(f'⚠️ 影片改以文字連結發送（預覽圖主機 LINE 可能讀不到）: {video_url}')
     else:
       print(f'⚠️ 影片已保留在本機，但無法產生 LINE 可讀網址。路徑: {video_path}')
 
