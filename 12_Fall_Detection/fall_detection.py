@@ -217,28 +217,72 @@ def upload_to_telegraph(image_path: Path) -> str | None:
   return None
 
 
-def probe_public_base_url() -> bool:
-  """檢查 PUBLIC_BASE_URL / cloudflared 是否還活著（避免沿用已失效的舊網址）。"""
-  if not PUBLIC_BASE_URL:
-    print('⚠️ 未設定 PUBLIC_BASE_URL：影片氣泡需要 cloudflared')
-    return False
+def _upload_headers() -> dict:
+  return {
+      'User-Agent': 'Mozilla/5.0 (X11; Linux aarch64) FallDetection/1.0',
+  }
+
+
+def upload_to_catbox(file_path: Path) -> str | None:
+  """上傳影片到 catbox（最早「點氣泡可播」常用的直連方式）。"""
   try:
-    res = requests.get(PUBLIC_BASE_URL.rstrip('/') + '/', timeout=10, allow_redirects=True)
-    # 隧道活著時通常 200；失效常見 530/1033 HTML
-    body_head = (res.text or '')[:200].lower()
-    dead = res.status_code in (530, 502, 503) or 'error 1033' in body_head or 'error 530' in body_head
-    if dead:
-      print(
-          f'❌ cloudflared 網址已失效（HTTP {res.status_code}）。'
-          f'請重新執行 cloudflared，把新的 https://... 寫进 .env 的 PUBLIC_BASE_URL，並重開程式。'
-          f' 目前: {PUBLIC_BASE_URL}'
+    with open(file_path, 'rb') as f:
+      res = requests.post(
+          'https://catbox.moe/user/api.php',
+          data={'reqtype': 'fileupload'},
+          files={'fileToUpload': (file_path.name, f, 'video/mp4')},
+          headers=_upload_headers(),
+          timeout=180,
       )
-      return False
-    print(f'✅ cloudflared 網址看起來可用: {PUBLIC_BASE_URL} （HTTP {res.status_code}）')
-    return True
+    text = (res.text or '').strip()
+    print(f'☁️ catbox 回應: status={res.status_code} body={text[:200]!r}')
+    if res.status_code == 200 and text.startswith('https://'):
+      print(f'☁️ catbox 上傳成功: {text}')
+      return text
+    print(f'❌ catbox 上傳失敗: {res.status_code} {text[:300]!r}')
   except Exception as e:
-    print(f'❌ 無法連到 PUBLIC_BASE_URL（{e}）。請確認 cloudflared 有在跑且網址最新')
-    return False
+    print(f'❌ catbox 上傳例外: {e}')
+  return None
+
+
+def upload_to_litterbox(file_path: Path, keep: str = '12h') -> str | None:
+  """catbox 姊妹站，檔案會自動過期。"""
+  try:
+    with open(file_path, 'rb') as f:
+      res = requests.post(
+          'https://litterbox.catbox.moe/resources/internals/api.php',
+          data={'reqtype': 'fileupload', 'time': keep},
+          files={'fileToUpload': (file_path.name, f, 'video/mp4')},
+          headers=_upload_headers(),
+          timeout=180,
+      )
+    text = (res.text or '').strip()
+    print(f'☁️ litterbox 回應: status={res.status_code} body={text[:200]!r}')
+    if res.status_code == 200 and text.startswith('https://'):
+      print(f'☁️ litterbox 上傳成功（{keep} 後刪）: {text}')
+      return text
+    print(f'❌ litterbox 上傳失敗: {res.status_code} {text[:300]!r}')
+  except Exception as e:
+    print(f'❌ litterbox 上傳例外: {e}')
+  return None
+
+
+def upload_video_for_line(video_path: Path) -> str | None:
+  """
+  影片優先 catbox / litterbox（直連 https://files.catbox.moe/... 或 litter）。
+  成功拿到 https 網址就採用，不再做過嚴檢查（避免誤殺）。
+  cloudflared 僅最後備援。
+  """
+  for uploader in (upload_to_catbox, lambda p: upload_to_litterbox(p, '12h')):
+    url = uploader(video_path)
+    if url and url.startswith('https://'):
+      return url
+
+  tunnel = public_media_url(video_path)
+  if tunnel:
+    print(f'🔗 catbox 失敗，改用 cloudflared 備援: {tunnel}')
+    return tunnel
+  return None
 
 
 def upload_image_for_line(image_path: Path) -> str | None:
@@ -333,9 +377,8 @@ def resolve_image_urls(original_path: Path, preview_path: Path) -> tuple[str | N
 
 def resolve_video_url(video_path: Path, preview_url: str | None) -> tuple[Path | None, str | None, str | None]:
   """
-  回到最初可行方案：
-  - 照片預覽：ImgBB（現在已能直接顯示）
-  - 影片本體：cloudflared PUBLIC_BASE_URL（最早點氣泡能播的方式）
+  - 照片／預覽：ImgBB（可直接顯示）
+  - 影片本體：catbox（點氣泡播放；封面仍用 ImgBB）
   """
   ready = ensure_line_h264_mp4(video_path)
   if ready is None:
@@ -347,13 +390,11 @@ def resolve_video_url(video_path: Path, preview_url: str | None) -> tuple[Path |
   except OSError:
     pass
 
-  if not probe_public_base_url():
-    return ready, None, preview_url
-
-  video_url = public_media_url(ready)
+  video_url = upload_video_for_line(ready)
   if not video_url:
+    print('⚠️ catbox/litterbox/cloudflared 都無法提供影片網址')
     return ready, None, preview_url
-  print(f'🎬 影片使用最初方案 cloudflared: {video_url}')
+  print(f'🎬 影片網址: {video_url}')
 
   if not preview_url or not line_can_embed_image(preview_url):
     sibling_preview = ready.parent / 'fall_preview.jpg'
@@ -906,12 +947,9 @@ if __name__ == '__main__':
   else:
     print('⚠️ 未設定 IMGBB_API_KEY：LINE 照片氣泡可能無法顯示')
 
-  if not PUBLIC_BASE_URL:
-    print('⚠️ 未設定 PUBLIC_BASE_URL：LINE 影片氣泡需要先開 cloudflared 並填入最新 https 網址')
-  elif not PUBLIC_BASE_URL.startswith('https://'):
-    print('⚠️ PUBLIC_BASE_URL 必須是 https:// ，LINE 才收得到媒體')
-  else:
-    probe_public_base_url()
+  print('🎬 影片將優先上傳 catbox；照片維持 ImgBB 直接顯示')
+  if PUBLIC_BASE_URL:
+    print(f'ℹ️ PUBLIC_BASE_URL 僅作影片備援: {PUBLIC_BASE_URL}')
 
   print(f'伺服器啟動：http://{HOST}:{PORT}')
   app.run(host=HOST, port=PORT, debug=False, threaded=True)
