@@ -135,22 +135,24 @@ def public_media_url(path: Path) -> str | None:
   return f'{PUBLIC_BASE_URL}/media/{rel}'
 
 
-def url_looks_like_image(url: str) -> bool:
-  """確認網址真的回傳圖片，避免 LINE 收到 HTML/轉址而顯示空白。"""
-  try:
-    res = requests.get(url, timeout=15, stream=True, allow_redirects=True)
-    ctype = (res.headers.get('Content-Type') or '').lower()
-    ok = res.status_code == 200 and ('image/' in ctype or url.lower().endswith(('.jpg', '.jpeg', '.png')))
-    # 讀一點內容確認不是 HTML
-    chunk = next(res.iter_content(64), b'')
-    if chunk.startswith(b'<') or chunk.startswith(b'<!'):
-      ok = False
-    res.close()
-    print(f'🔎 檢查圖片網址: status={res.status_code} type={ctype} ok={ok}')
-    return ok
-  except Exception as e:
-    print(f'🔎 圖片網址檢查失敗: {e}')
+def is_direct_https_media_url(url: str) -> bool:
+  """上傳成功回傳的直連網址即可採用；不再強制二次下載驗證（Pi 常被圖床斷線誤判）。"""
+  if not url or not url.startswith('https://'):
     return False
+  lower = url.lower()
+  # catbox / imgbb / 常見圖床
+  if any(
+      host in lower
+      for host in (
+          'files.catbox.moe/',
+          'litter.catbox.moe/',
+          'i.ibb.co/',
+          'ibb.co/',
+          '0x0.st/',
+      )
+  ):
+    return True
+  return lower.endswith(('.jpg', '.jpeg', '.png', '.mp4'))
 
 
 def upload_to_imgbb(image_path: Path) -> str | None:
@@ -166,15 +168,15 @@ def upload_to_imgbb(image_path: Path) -> str | None:
     res = requests.post('https://api.imgbb.com/1/upload', data=payload, timeout=20)
     data = res.json()
     if res.status_code == 200 and data.get('success'):
-      # 優先用直連 image.url，較少轉址問題
       url = (
           data.get('data', {}).get('image', {}).get('url')
+          or data.get('data', {}).get('display_url')
           or data.get('data', {}).get('url')
       )
-      if url and url_looks_like_image(url):
+      if url and is_direct_https_media_url(url):
         print(f'☁️ ImgBB 上傳成功: {url}')
         return url
-      print(f'⚠️ ImgBB 有網址但 LINE 可能讀不到: {url}')
+      print(f'⚠️ ImgBB 回傳網址不可用: {url}')
     print(f'❌ ImgBB 上傳失敗: {res.status_code} {res.text[:300]}')
   except Exception as e:
     print(f'❌ ImgBB 上傳例外: {e}')
@@ -202,7 +204,7 @@ def upload_to_catbox(file_path: Path) -> str | None:
 
 
 def upload_to_0x0(file_path: Path) -> str | None:
-  """備援圖床 0x0.st。"""
+  """備援圖床 0x0.st（目前常關閉，失敗可忽略）。"""
   try:
     with open(file_path, 'rb') as f:
       res = requests.post('https://0x0.st', files={'file': (file_path.name, f)}, timeout=60)
@@ -220,9 +222,7 @@ def upload_image_for_line(image_path: Path) -> str | None:
   """照片專用：只走圖床，不走 cloudflared（quick tunnel 常被 LINE 擋）。"""
   for uploader in (upload_to_imgbb, upload_to_catbox, upload_to_0x0):
     url = uploader(image_path)
-    if not url:
-      continue
-    if uploader is upload_to_imgbb or url_looks_like_image(url):
+    if url and is_direct_https_media_url(url):
       return url
   return None
 
@@ -286,22 +286,37 @@ def resolve_image_urls(original_path: Path, preview_path: Path) -> tuple[str | N
   return None, None
 
 
-def resolve_video_url(video_path: Path, preview_url: str | None) -> str | None:
-  """影片：先轉 H.264，再 catbox；失敗才用隧道。"""
-  if not preview_url:
-    return None
+def resolve_video_url(video_path: Path, preview_url: str | None) -> tuple[str | None, str | None]:
+  """
+  影片：先轉 H.264，再 catbox。
+  回傳 (video_url, preview_url)。若缺預覽圖，會重傳一張。
+  """
   ready = ensure_line_h264_mp4(video_path)
   if ready is None:
-    return None
+    return None, preview_url
 
   uploaded = upload_to_catbox(ready) or upload_to_0x0(ready)
-  if uploaded:
-    return uploaded
+  if not uploaded:
+    tunnel = public_media_url(ready)
+    if tunnel:
+      print(f'🔗 使用隧道影片網址: {tunnel}')
+      uploaded = tunnel
 
-  tunnel = public_media_url(ready)
-  if tunnel:
-    print(f'🔗 使用隧道影片網址: {tunnel}')
-  return tunnel
+  if uploaded and not preview_url:
+    # 影片訊息仍需要預覽圖；用同資料夾 preview / original 再試
+    sibling_preview = ready.parent / 'fall_preview.jpg'
+    sibling_original = ready.parent / 'fall_original.jpg'
+    for candidate in (sibling_preview, sibling_original):
+      if candidate.exists():
+        preview_url = upload_image_for_line(candidate)
+        if preview_url:
+          break
+
+  if uploaded and not preview_url:
+    print('⚠️ 有影片網址但缺少預覽圖，LINE 影片訊息無法送出')
+    return None, None
+
+  return uploaded, preview_url
 
 
 def send_line_messages(messages: list[dict]) -> bool:
@@ -352,7 +367,7 @@ def send_fall_alert(
     print('⚠️ 無法上傳照片到圖床；照片已保存在本機。建議設定 IMGBB_API_KEY')
 
   if video_path and video_path.exists():
-    video_url = resolve_video_url(video_path, preview_url)
+    video_url, preview_url = resolve_video_url(video_path, preview_url)
     if video_url and preview_url:
       messages.append(
           {
