@@ -217,131 +217,28 @@ def upload_to_telegraph(image_path: Path) -> str | None:
   return None
 
 
-def upload_to_catbox(file_path: Path) -> str | None:
-  """匿名上傳到 catbox（備援）。"""
-  try:
-    with open(file_path, 'rb') as f:
-      res = requests.post(
-          'https://catbox.moe/user/api.php',
-          data={'reqtype': 'fileupload'},
-          files={'fileToUpload': (file_path.name, f, 'video/mp4')},
-          timeout=180,
-      )
-    text = (res.text or '').strip()
-    if res.status_code == 200 and text.startswith('https://'):
-      print(f'☁️ catbox 上傳成功: {text}')
-      return text
-    print(f'❌ catbox 上傳失敗: {res.status_code} {text[:300]!r}')
-  except Exception as e:
-    print(f'❌ catbox 上傳例外: {e}')
-  return None
-
-
-def upload_to_litterbox(file_path: Path, keep: str = '1h') -> str | None:
-  """暫時檔案站（1h/12h/24h/72h 後自動刪），較適合跌倒短片。"""
-  try:
-    with open(file_path, 'rb') as f:
-      res = requests.post(
-          'https://litterbox.catbox.moe/resources/internals/api.php',
-          data={'reqtype': 'fileupload', 'time': keep},
-          files={'fileToUpload': (file_path.name, f, 'video/mp4')},
-          timeout=180,
-      )
-    text = (res.text or '').strip()
-    if res.status_code == 200 and text.startswith('https://'):
-      print(f'☁️ litterbox 上傳成功（{keep} 後刪）: {text}')
-      return text
-    print(f'❌ litterbox 上傳失敗: {res.status_code} {text[:300]!r}')
-  except Exception as e:
-    print(f'❌ litterbox 上傳例外: {e}')
-  return None
-
-
-def upload_to_tmpfiles(file_path: Path) -> str | None:
-  """tmpfiles.org 暫存；轉成 /dl/ 直連，避免網頁轉址。"""
-  try:
-    with open(file_path, 'rb') as f:
-      res = requests.post(
-          'https://tmpfiles.org/api/v1/upload',
-          files={'file': (file_path.name, f, 'video/mp4')},
-          timeout=180,
-      )
-    data = res.json()
-    page_url = (data.get('data') or {}).get('url') or ''
-    if data.get('status') == 'success' and page_url:
-      direct = page_url.replace('http://', 'https://')
-      # https://tmpfiles.org/12345/name.mp4 -> https://tmpfiles.org/dl/12345/name.mp4
-      if '/dl/' not in direct:
-        direct = direct.replace('tmpfiles.org/', 'tmpfiles.org/dl/', 1)
-      print(f'☁️ tmpfiles 上傳成功: {direct}')
-      return direct
-    print(f'❌ tmpfiles 上傳失敗: {res.status_code} {str(data)[:300]}')
-  except Exception as e:
-    print(f'❌ tmpfiles 上傳例外: {e}')
-  return None
-
-
-def video_url_is_reachable(url: str) -> bool:
-  """
-  送進 LINE 前先確認網址真的回得了影片。
-  cloudflared 若出現 Error 1033 / 303 轉址／HTML，這裡會擋下，避免「封面有、點進去錯誤不明」。
-  """
-  try:
-    res = requests.get(url, timeout=20, stream=True, allow_redirects=True)
-    ctype = (res.headers.get('Content-Type') or '').lower()
-    # 讀一點內容判斷是不是 HTML 錯誤頁
-    chunk = next(res.iter_content(256), b'')
-    res.close()
-    looks_html = chunk.lstrip().startswith(b'<') or 'text/html' in ctype
-    ok = (
-        res.status_code == 200
-        and not looks_html
-        and (
-            'video/' in ctype
-            or 'octet-stream' in ctype
-            or url.lower().endswith('.mp4')
-        )
-    )
-    print(
-        f'🔎 影片網址檢查: status={res.status_code} type={ctype} '
-        f'ok={ok} url={url}'
-    )
-    return ok
-  except Exception as e:
-    print(f'🔎 影片網址檢查失敗: {e}')
+def probe_public_base_url() -> bool:
+  """檢查 PUBLIC_BASE_URL / cloudflared 是否還活著（避免沿用已失效的舊網址）。"""
+  if not PUBLIC_BASE_URL:
+    print('⚠️ 未設定 PUBLIC_BASE_URL：影片氣泡需要 cloudflared')
     return False
-
-
-def upload_video_for_line(video_path: Path) -> str | None:
-  """
-  影片主機優先序（都需通過可播放檢查）：
-  1) litterbox（1 小時後刪）
-  2) tmpfiles
-  3) catbox
-  4) cloudflared PUBLIC_BASE_URL
-  """
-  candidates: list[str] = []
-  for uploader in (
-      lambda p: upload_to_litterbox(p, '1h'),
-      upload_to_tmpfiles,
-      upload_to_catbox,
-  ):
-    url = uploader(video_path)
-    if url:
-      candidates.append(url)
-
-  tunnel = public_media_url(video_path)
-  if tunnel:
-    print(f'🔗 備援 cloudflared 影片網址: {tunnel}')
-    candidates.append(tunnel)
-
-  for url in candidates:
-    if video_url_is_reachable(url):
-      print(f'✅ 採用可播放影片網址: {url}')
-      return url
-    print(f'⏭️ 略過不可播放網址: {url}')
-
-  return None
+  try:
+    res = requests.get(PUBLIC_BASE_URL.rstrip('/') + '/', timeout=10, allow_redirects=True)
+    # 隧道活著時通常 200；失效常見 530/1033 HTML
+    body_head = (res.text or '')[:200].lower()
+    dead = res.status_code in (530, 502, 503) or 'error 1033' in body_head or 'error 530' in body_head
+    if dead:
+      print(
+          f'❌ cloudflared 網址已失效（HTTP {res.status_code}）。'
+          f'請重新執行 cloudflared，把新的 https://... 寫进 .env 的 PUBLIC_BASE_URL，並重開程式。'
+          f' 目前: {PUBLIC_BASE_URL}'
+      )
+      return False
+    print(f'✅ cloudflared 網址看起來可用: {PUBLIC_BASE_URL} （HTTP {res.status_code}）')
+    return True
+  except Exception as e:
+    print(f'❌ 無法連到 PUBLIC_BASE_URL（{e}）。請確認 cloudflared 有在跑且網址最新')
+    return False
 
 
 def upload_image_for_line(image_path: Path) -> str | None:
@@ -436,29 +333,27 @@ def resolve_image_urls(original_path: Path, preview_path: Path) -> tuple[str | N
 
 def resolve_video_url(video_path: Path, preview_url: str | None) -> tuple[Path | None, str | None, str | None]:
   """
-  影片給 LINE 氣泡播放：
-  - 影片檔：litterbox/tmpfiles（直連）優先；cloudflared 常出現 Error 1033/303
-  - 預覽圖：ImgBB
-  回傳 (ready_path, video_url, preview_url)
+  回到最初可行方案：
+  - 照片預覽：ImgBB（現在已能直接顯示）
+  - 影片本體：cloudflared PUBLIC_BASE_URL（最早點氣泡能播的方式）
   """
   ready = ensure_line_h264_mp4(video_path)
   if ready is None:
     return None, None, preview_url
 
-  # 壓小一點，提高 LINE 接受率
   try:
     size_mb = ready.stat().st_size / (1024 * 1024)
     print(f'📦 影片大小約 {size_mb:.2f} MB')
   except OSError:
     pass
 
-  video_url = upload_video_for_line(ready)
-  if not video_url:
-    print(
-        '⚠️ 找不到 LINE 可播放的影片網址。'
-        '（cloudflared 若顯示 Error 1033/303 代表隧道或網址失效）'
-    )
+  if not probe_public_base_url():
     return ready, None, preview_url
+
+  video_url = public_media_url(ready)
+  if not video_url:
+    return ready, None, preview_url
+  print(f'🎬 影片使用最初方案 cloudflared: {video_url}')
 
   if not preview_url or not line_can_embed_image(preview_url):
     sibling_preview = ready.parent / 'fall_preview.jpg'
@@ -470,7 +365,7 @@ def resolve_video_url(video_path: Path, preview_url: str | None) -> tuple[Path |
           break
 
   if not preview_url or not line_can_embed_image(preview_url):
-    print('⚠️ 影片預覽圖無法用 ImgBB 產生，LINE 影片訊息可能失敗')
+    print('⚠️ 影片預覽圖需要 ImgBB；請確認 IMGBB_API_KEY')
     return ready, video_url, None
 
   return ready, video_url, preview_url
@@ -1007,15 +902,16 @@ if __name__ == '__main__':
   if IMGBB_API_KEY:
     print(
         f'☁️ ImgBB 已設定｜照片約 {IMGBB_EXPIRATION_SECONDS / 60:g} 分鐘後由圖床自動刪除'
-        '（LINE 聊天多半仍可看已快取的圖）'
     )
-  if not PUBLIC_BASE_URL and not IMGBB_API_KEY:
-    print(
-        '⚠️ 未設定 IMGBB_API_KEY：'
-        '確認跌倒時仍會存本機照片/影片，但 LINE 圖片氣泡可能無法顯示'
-    )
-  elif PUBLIC_BASE_URL and not PUBLIC_BASE_URL.startswith('https://'):
+  else:
+    print('⚠️ 未設定 IMGBB_API_KEY：LINE 照片氣泡可能無法顯示')
+
+  if not PUBLIC_BASE_URL:
+    print('⚠️ 未設定 PUBLIC_BASE_URL：LINE 影片氣泡需要先開 cloudflared 並填入最新 https 網址')
+  elif not PUBLIC_BASE_URL.startswith('https://'):
     print('⚠️ PUBLIC_BASE_URL 必須是 https:// ，LINE 才收得到媒體')
+  else:
+    probe_public_base_url()
 
   print(f'伺服器啟動：http://{HOST}:{PORT}')
   app.run(host=HOST, port=PORT, debug=False, threaded=True)
