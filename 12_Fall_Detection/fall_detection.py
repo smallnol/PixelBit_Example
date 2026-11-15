@@ -315,7 +315,7 @@ def resolve_video_url(video_path: Path, preview_url: str | None) -> tuple[str | 
   if ready is None:
     return None, preview_url
 
-  uploaded = upload_to_catbox(ready) or upload_to_0x0(ready)
+  uploaded = upload_to_catbox(ready)
   if not uploaded:
     tunnel = public_media_url(ready)
     if tunnel:
