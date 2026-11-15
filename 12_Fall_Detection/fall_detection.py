@@ -41,6 +41,12 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
 LINE_USER_ID = os.getenv('LINE_USER_ID', '').strip()
 PUBLIC_BASE_URL = os.getenv('PUBLIC_BASE_URL', '').rstrip('/')
 IMGBB_API_KEY = os.getenv('IMGBB_API_KEY', '').strip()
+# ImgBB 自動刪除秒數（最短 60，最長 15552000）；預設 600 = 10 分鐘
+try:
+  IMGBB_EXPIRATION_SECONDS = int(os.getenv('IMGBB_EXPIRATION_SECONDS', '600'))
+except ValueError:
+  IMGBB_EXPIRATION_SECONDS = 600
+IMGBB_EXPIRATION_SECONDS = max(60, min(IMGBB_EXPIRATION_SECONDS, 15_552_000))
 
 CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
 HOST = os.getenv('HOST', '0.0.0.0')
@@ -156,7 +162,7 @@ def is_direct_https_media_url(url: str) -> bool:
 
 
 def upload_to_imgbb(image_path: Path) -> str | None:
-  """ImgBB 上傳照片（需 API key）— 對 LINE 顯示通常最穩。"""
+  """ImgBB 上傳照片（需 API key）— 對 LINE 顯示通常最穩；可設定自動過期刪除。"""
   if not IMGBB_API_KEY:
     return None
   try:
@@ -164,6 +170,8 @@ def upload_to_imgbb(image_path: Path) -> str | None:
       payload = {
           'key': IMGBB_API_KEY,
           'image': base64.b64encode(f.read()).decode('utf-8'),
+          # 10 分鐘 = 600 秒；讓第三方圖床自動刪，降低長期留存
+          'expiration': str(IMGBB_EXPIRATION_SECONDS),
       }
     res = requests.post('https://api.imgbb.com/1/upload', data=payload, timeout=20)
     data = res.json()
@@ -174,7 +182,8 @@ def upload_to_imgbb(image_path: Path) -> str | None:
           or data.get('data', {}).get('url')
       )
       if url and url.startswith('https://'):
-        print(f'☁️ ImgBB 上傳成功: {url}')
+        mins = IMGBB_EXPIRATION_SECONDS / 60
+        print(f'☁️ ImgBB 上傳成功（約 {mins:g} 分鐘後自動刪）: {url}')
         return url
       print(f'⚠️ ImgBB 回傳網址不可用: {url}')
     print(f'❌ ImgBB 上傳失敗: {res.status_code} {res.text[:300]}')
@@ -879,10 +888,15 @@ if __name__ == '__main__':
     )
   else:
     print('⚠️ 尚未讀到 LINE 憑證：請確認 .env 已存檔，且與此 .py 同一資料夾後重新啟動')
+  if IMGBB_API_KEY:
+    print(
+        f'☁️ ImgBB 已設定｜照片約 {IMGBB_EXPIRATION_SECONDS / 60:g} 分鐘後由圖床自動刪除'
+        '（LINE 聊天多半仍可看已快取的圖）'
+    )
   if not PUBLIC_BASE_URL and not IMGBB_API_KEY:
     print(
-        '⚠️ 未設定 PUBLIC_BASE_URL 或 IMGBB_API_KEY：'
-        '確認跌倒時仍會存本機照片/影片，但 LINE 可能只能收到文字'
+        '⚠️ 未設定 IMGBB_API_KEY：'
+        '確認跌倒時仍會存本機照片/影片，但 LINE 圖片氣泡可能無法顯示'
     )
   elif PUBLIC_BASE_URL and not PUBLIC_BASE_URL.startswith('https://'):
     print('⚠️ PUBLIC_BASE_URL 必須是 https:// ，LINE 才收得到媒體')
