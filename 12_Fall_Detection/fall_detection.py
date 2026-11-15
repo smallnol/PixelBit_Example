@@ -3,9 +3,10 @@
 
 流程：
 1. 預設僅骨架預覽（不警報）
-2. 開啟偵測後，若姿勢異常 → 開始錄「疑似跌倒」短片
-3. 持續異常滿 FALL_CONFIRM_SECONDS → 確認跌倒：保留媒體、推播 LINE（文字+照片，可選影片）
-4. 若在確認前站起來 → 自動刪除疑似短片與暫存照片
+2. 鏡頭持續保留最近約 30 秒畫面（行車紀錄器式循環緩衝；逾時自動丟掉）
+3. 開啟偵測後，若姿勢異常 → 用「跌倒前 30 秒 + 倒地過程」開始組影片
+4. 持續異常滿 FALL_CONFIRM_SECONDS → 確認跌倒：推播 LINE（ImgBB 照片 + litterbox/catbox 影片）
+5. 若在確認前站起來 → 自動刪除疑似短片與暫存照片
 """
 
 from __future__ import annotations
@@ -55,10 +56,16 @@ PORT = int(os.getenv('PORT', '5000'))
 # --- 偵測參數 ---
 FALL_CONFIRM_SECONDS = 10.0
 ALERT_COOLDOWN_SECONDS = 30.0
-PRE_ROLL_SECONDS = 3.0  # 跌倒前多留幾秒畫面進影片
+# 行車紀錄器式：持續保留最近 N 秒；沒跌倒就隨時間自動覆蓋刪除
+ROLLING_BUFFER_SECONDS = float(os.getenv('ROLLING_BUFFER_SECONDS', '30'))
 CLIP_FPS = 10.0
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
+# litterbox 只支援 1h / 12h / 24h / 72h（沒有 10 分鐘）；預設用最短 1h
+LITTERBOX_KEEP = os.getenv('LITTERBOX_KEEP', '1h').strip() or '1h'
+if LITTERBOX_KEEP not in {'1h', '12h', '24h', '72h'}:
+  print(f'⚠️ LITTERBOX_KEEP={LITTERBOX_KEEP} 無效，改用 1h')
+  LITTERBOX_KEEP = '1h'
 
 app = Flask(__name__)
 
@@ -75,9 +82,17 @@ cap = cv2.VideoCapture(CAMERA_INDEX)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
-# 跌倒前畫面緩衝（約 PRE_ROLL_SECONDS）
-pre_roll_maxlen = max(1, int(PRE_ROLL_SECONDS * CLIP_FPS))
-pre_roll_buffer: deque[np.ndarray] = deque(maxlen=pre_roll_maxlen)
+# 循環緩衝：存 JPEG，比存原始幀省記憶體；超過时长自動丟掉最舊畫面
+rolling_maxlen = max(1, int(ROLLING_BUFFER_SECONDS * CLIP_FPS))
+rolling_buffer: deque[bytes] = deque(maxlen=rolling_maxlen)
+print(
+    f'🎥 循環錄影緩衝約 {ROLLING_BUFFER_SECONDS:g} 秒'
+    f'（最多 {rolling_maxlen} 幀 @ {CLIP_FPS:g} fps；無跌倒會自動覆蓋）'
+)
+print(
+    f'☁️ 影片上傳 litterbox 保存 {LITTERBOX_KEEP}'
+    '（此服務最短 1 小時，無法設 10 分鐘）'
+)
 
 
 def _now_stamp() -> str:
@@ -245,8 +260,9 @@ def upload_to_catbox(file_path: Path) -> str | None:
   return None
 
 
-def upload_to_litterbox(file_path: Path, keep: str = '12h') -> str | None:
-  """catbox 姊妹站，檔案會自動過期。"""
+def upload_to_litterbox(file_path: Path, keep: str | None = None) -> str | None:
+  """catbox 姊妹站，檔案會自動過期（僅 1h/12h/24h/72h）。"""
+  keep = keep or LITTERBOX_KEEP
   try:
     with open(file_path, 'rb') as f:
       res = requests.post(
@@ -269,20 +285,29 @@ def upload_to_litterbox(file_path: Path, keep: str = '12h') -> str | None:
 
 def upload_video_for_line(video_path: Path) -> str | None:
   """
-  影片優先 catbox / litterbox（直連 https://files.catbox.moe/... 或 litter）。
-  成功拿到 https 網址就採用，不再做過嚴檢查（避免誤殺）。
-  cloudflared 僅最後備援。
+  影片優先 litterbox（你目前可播且會自動刪），其次 catbox，最後 cloudflared。
   """
-  for uploader in (upload_to_catbox, lambda p: upload_to_litterbox(p, '12h')):
+  for uploader in (upload_to_litterbox, upload_to_catbox):
     url = uploader(video_path)
     if url and url.startswith('https://'):
       return url
 
   tunnel = public_media_url(video_path)
   if tunnel:
-    print(f'🔗 catbox 失敗，改用 cloudflared 備援: {tunnel}')
+    print(f'🔗 圖床失敗，改用 cloudflared 備援: {tunnel}')
     return tunnel
   return None
+
+
+def decode_rolling_frame(jpg_bytes: bytes, frame_size: tuple[int, int]) -> np.ndarray | None:
+  arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
+  frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+  if frame is None:
+    return None
+  w, h = frame_size
+  if frame.shape[1] != w or frame.shape[0] != h:
+    frame = cv2.resize(frame, (w, h))
+  return frame
 
 
 def upload_image_for_line(image_path: Path) -> str | None:
@@ -518,7 +543,7 @@ def open_video_writer(
 
 
 def start_suspect_event(first_frame: np.ndarray) -> dict:
-  """疑似跌倒開始：建立暫存目錄、先寫入 pre-roll，再持續錄影。"""
+  """疑似跌倒開始：寫入循環緩衝（約跌倒前 30 秒），再繼續錄倒地過程。"""
   event_id = f'{_now_stamp()}_{uuid.uuid4().hex[:6]}'
   event_dir = PENDING_DIR / event_id
   event_dir.mkdir(parents=True, exist_ok=True)
@@ -526,16 +551,23 @@ def start_suspect_event(first_frame: np.ndarray) -> dict:
   h, w = first_frame.shape[:2]
   writer, video_path = open_video_writer(event_dir, (w, h))
 
+  pre_count = 0
   if writer is not None:
-    for buffered in list(pre_roll_buffer):
-      if buffered.shape[1] != w or buffered.shape[0] != h:
-        buffered = cv2.resize(buffered, (w, h))
-      writer.write(buffered)
+    # 先倒出「跌倒前」循環緩衝，讓家屬看到前因
+    for jpg in list(rolling_buffer):
+      frame = decode_rolling_frame(jpg, (w, h))
+      if frame is None:
+        continue
+      writer.write(frame)
+      pre_count += 1
     writer.write(first_frame)
 
   original_path, preview_path = save_line_images(first_frame, 'suspect', event_dir)
-
-  print(f'⚠️ 疑似跌倒，開始錄影事件: {event_id}')
+  pre_seconds = pre_count / CLIP_FPS if CLIP_FPS else 0
+  print(
+      f'⚠️ 疑似跌倒，開始錄影事件: {event_id}'
+      f'｜已附上跌倒前約 {pre_seconds:.1f}s 循環緩衝'
+  )
   return {
       'id': event_id,
       'dir': event_dir,
@@ -544,6 +576,7 @@ def start_suspect_event(first_frame: np.ndarray) -> dict:
       'photo_original': original_path,
       'photo_preview': preview_path,
       'frame_size': (w, h),
+      'pre_roll_frames': pre_count,
   }
 
 
@@ -676,10 +709,14 @@ def generate_frames():
       results = model.predict(source=frame, imgsz=320, conf=0.5, verbose=False)
       annotated_frame = results[0].plot()
 
-      # 維護跌倒前緩衝（降採樣到 CLIP_FPS，避免記憶體爆）
+      # 行車紀錄器式循環緩衝（JPEG；逾時自動覆蓋最舊畫面）
       now = time.time()
       if now - last_buffer_time >= frame_interval:
-        pre_roll_buffer.append(annotated_frame.copy())
+        ok_jpg, jpg_buf = cv2.imencode(
+            '.jpg', annotated_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70]
+        )
+        if ok_jpg:
+          rolling_buffer.append(jpg_buf.tobytes())
         last_buffer_time = now
 
       status_msg = '--> 【等待偵測人體】'
@@ -746,6 +783,7 @@ def generate_frames():
                     '樹莓派系統偵測到人體跌倒倒地！\n'
                     f'倒地型態: {fall_type}\n'
                     f'持續時間: {round(elapsed_fall_time, 1)} 秒\n'
+                    f'影片含跌倒前約 {ROLLING_BUFFER_SECONDS:g} 秒前情＋倒地過程\n'
                     '請立即確認現場狀況！'
                 )
                 send_fall_alert(alert_msg, original_path, preview_path, video_path)
@@ -913,8 +951,8 @@ def index():
         </div>
         <div id="status-text">當前狀態：🟡 僅骨架測試 (不會發送 LINE)</div>
         <p class="hint">
-          疑似跌倒會先暫存短片；若在確認時間內站起來會自動刪除。
-          確認跌倒後會推播 LINE 文字＋照片（有設定公開 HTTPS 網址時可再附影片）。
+          鏡頭會持續保留最近約 30 秒畫面（無跌倒自動覆蓋）。
+          確認跌倒後，LINE 會收到照片＋含前情的短片；未確認的暫存會刪除。
         </p>
         <img src="/video_feed" width="640" alt="video feed">
     </body>
