@@ -27,9 +27,10 @@ from dotenv import load_dotenv
 from flask import Flask, Response, render_template_string, send_from_directory
 from ultralytics import YOLO
 
-load_dotenv()
-
+# 固定從「這個 .py 檔所在資料夾」讀 .env（避免工作目錄不同而讀不到）
 BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / '.env')
+
 PENDING_DIR = BASE_DIR / 'events' / 'pending'
 CONFIRMED_DIR = BASE_DIR / 'events' / 'confirmed'
 PENDING_DIR.mkdir(parents=True, exist_ok=True)
@@ -655,8 +656,15 @@ def video_feed():
 
 
 if __name__ == '__main__':
-  if not _line_configured():
-    print('⚠️ 尚未設定 LINE 憑證：請複製 .env.example 為 .env 並填入 Token / User ID')
+  env_path = BASE_DIR / '.env'
+  print(f'📂 .env 路徑: {env_path} （存在: {env_path.exists()}）')
+  if _line_configured():
+    print(
+        f'🔐 LINE 設定已載入｜Token 長度={len(LINE_CHANNEL_ACCESS_TOKEN)}｜'
+        f'UserID 開頭={LINE_USER_ID[:4]}...'
+    )
+  else:
+    print('⚠️ 尚未讀到 LINE 憑證：請確認 .env 已存檔，且與此 .py 同一資料夾後重新啟動')
   if not PUBLIC_BASE_URL and not IMGBB_API_KEY:
     print(
         '⚠️ 未設定 PUBLIC_BASE_URL 或 IMGBB_API_KEY：'
