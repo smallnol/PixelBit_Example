@@ -372,21 +372,64 @@ def send_line_messages(messages: list[dict]) -> bool:
   return False
 
 
+def line_can_embed_image(url: str | None) -> bool:
+  # LINE 伺服器需能抓圖；catbox 常失敗，telegra.ph / imgbb 較穩
+  if not url:
+    return False
+  u = url.lower()
+  return ('telegra.ph/' in u) or ('i.ibb.co/' in u) or ('ibb.co/' in u)
+
+
+def extract_video_stills(video_path: Path, count: int = 2) -> list[Path]:
+  """從跌倒短片抽幾張關鍵影格，改以 ImgBB 圖片訊息顯示（LINE 播不了 catbox 影片）。"""
+  cap = cv2.VideoCapture(str(video_path))
+  if not cap.isOpened():
+    return []
+
+  total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+  frames: list[np.ndarray] = []
+
+  if total > 0:
+    # 取約 1/3、2/3 位置（避開開頭緩衝）
+    positions = sorted(
+        {max(0, min(total - 1, total * (i + 1) // (count + 1))) for i in range(count)}
+    )
+    for pos in positions:
+      cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+      ok, frame = cap.read()
+      if ok:
+        frames.append(frame)
+  else:
+    all_frames: list[np.ndarray] = []
+    while True:
+      ok, frame = cap.read()
+      if not ok:
+        break
+      all_frames.append(frame)
+    if all_frames:
+      for i in range(count):
+        idx = max(0, min(len(all_frames) - 1, len(all_frames) * (i + 1) // (count + 1)))
+        frames.append(all_frames[idx])
+
+  cap.release()
+
+  out_paths: list[Path] = []
+  for i, frame in enumerate(frames, start=1):
+    out = video_path.parent / f'fall_still_{i}.jpg'
+    save_line_safe_jpeg(frame, out, max_side=1024, max_bytes=900_000)
+    out_paths.append(out)
+  print(f'🎞️ 已從影片抽出 {len(out_paths)} 張關鍵影格')
+  return out_paths
+
+
 def send_fall_alert(
     message_text: str,
     original_path: Path,
     preview_path: Path,
     video_path: Path | None = None,
 ) -> None:
-  """推播文字 + 照片；若有公開 HTTPS 網址再附影片。"""
+  """推播文字 + 照片；影片改抽影格上 ImgBB，並附瀏覽器可開的影片連結。"""
   messages: list[dict] = [{'type': 'text', 'text': message_text}]
-
-  def line_can_embed_image(url: str | None) -> bool:
-    # LINE 伺服器需能抓圖；catbox 常失敗，telegra.ph / imgbb 較穩
-    if not url:
-      return False
-    u = url.lower()
-    return ('telegra.ph/' in u) or ('i.ibb.co/' in u) or ('ibb.co/' in u)
 
   original_url, preview_url = resolve_image_urls(original_path, preview_path)
   if original_url and preview_url:
@@ -409,23 +452,31 @@ def send_fall_alert(
     print('⚠️ 無法上傳照片到圖床；照片已保存在本機。建議設定 IMGBB_API_KEY')
 
   if video_path and video_path.exists():
-    video_url, preview_url = resolve_video_url(video_path, preview_url)
-    if video_url and preview_url and line_can_embed_image(preview_url):
-      messages.append(
-          {
-              'type': 'video',
-              'originalContentUrl': video_url,
-              'previewImageUrl': preview_url,
-          }
+    # ImgBB 不支援影片；catbox 影片在 LINE 內常「錯誤不明」
+    # 因此：1) 抽影格用 ImgBB 顯示  2) 完整影片改放文字連結（手機瀏覽器開）
+    ready = ensure_line_h264_mp4(video_path) or video_path
+    video_url = upload_to_catbox(ready)
+    if video_url:
+      messages[0]['text'] += (
+          f'\n🎬 完整影片請用瀏覽器開啟（LINE 內嵌影片目前不穩）:\n{video_url}'
       )
-      print(f'🎬 將附帶跌倒影片: {video_url}')
-      messages[0]['text'] += f'\n🎬 影片連結:\n{video_url}'
-    elif video_url:
-      # 預覽圖若 LINE 讀不到，影片氣泡也常是灰的；改放文字連結較清楚
-      messages[0]['text'] += f'\n🎬 影片連結:\n{video_url}'
-      print(f'⚠️ 影片改以文字連結發送（預覽圖主機 LINE 可能讀不到）: {video_url}')
+      print(f'🎬 影片改以文字連結發送: {video_url}')
     else:
-      print(f'⚠️ 影片已保留在本機，但無法產生 LINE 可讀網址。路徑: {video_path}')
+      print(f'⚠️ 影片已保留在本機，但無法上傳。路徑: {video_path}')
+
+    for still in extract_video_stills(ready, count=2):
+      if len(messages) >= 5:
+        break
+      still_url = upload_image_for_line(still)
+      if still_url and line_can_embed_image(still_url):
+        messages.append(
+            {
+                'type': 'image',
+                'originalContentUrl': still_url,
+                'previewImageUrl': still_url,
+            }
+        )
+        print(f'🖼️ 影格已加入 LINE 圖片訊息: {still_url}')
 
   if len(messages) > 1:
     for i, msg in enumerate(messages[1:], start=1):
