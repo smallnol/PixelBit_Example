@@ -122,7 +122,7 @@ def public_media_url(path: Path) -> str | None:
 
 
 def upload_to_imgbb(image_path: Path) -> str | None:
-  """沒有公開網址時，可用 ImgBB 上傳照片（影片不適用）。"""
+  """ImgBB 上傳照片（需 API key）。"""
   if not IMGBB_API_KEY:
     return None
   try:
@@ -134,26 +134,125 @@ def upload_to_imgbb(image_path: Path) -> str | None:
     res = requests.post('https://api.imgbb.com/1/upload', data=payload, timeout=20)
     data = res.json()
     if res.status_code == 200 and data.get('success'):
-      return data['data']['url']
+      url = data['data']['url']
+      print(f'☁️ ImgBB 上傳成功: {url}')
+      return url
     print(f'❌ ImgBB 上傳失敗: {res.status_code} {res.text[:300]}')
   except Exception as e:
     print(f'❌ ImgBB 上傳例外: {e}')
   return None
 
 
-def resolve_image_urls(original_path: Path, preview_path: Path) -> tuple[str | None, str | None]:
-  original_url = public_media_url(original_path)
-  preview_url = public_media_url(preview_path)
+def upload_to_catbox(file_path: Path) -> str | None:
+  """匿名上傳到 catbox，取得直連 HTTPS（照片/影片都可用；比 quick tunnel 對 LINE 穩）。"""
+  try:
+    with open(file_path, 'rb') as f:
+      res = requests.post(
+          'https://catbox.moe/user/api.php',
+          data={'reqtype': 'fileupload'},
+          files={'fileToUpload': (file_path.name, f)},
+          timeout=120,
+      )
+    text = (res.text or '').strip()
+    if res.status_code == 200 and text.startswith('https://'):
+      print(f'☁️ catbox 上傳成功: {text}')
+      return text
+    print(f'❌ catbox 上傳失敗: {res.status_code} {text[:300]}')
+  except Exception as e:
+    print(f'❌ catbox 上傳例外: {e}')
+  return None
 
+
+def ensure_line_h264_mp4(video_path: Path) -> Path | None:
+  """LINE 影片較吃 H.264；若系統有 ffmpeg 就轉檔，否則回傳原檔讓後續嘗試。"""
+  if video_path is None or not video_path.exists():
+    return None
+  if video_path.suffix.lower() != '.mp4' and video_path.suffix.lower() != '.avi':
+    return video_path
+
+  out_path = video_path.with_name(video_path.stem + '_h264.mp4')
+  cmd = [
+      'ffmpeg',
+      '-y',
+      '-i',
+      str(video_path),
+      '-c:v',
+      'libx264',
+      '-pix_fmt',
+      'yuv420p',
+      '-movflags',
+      '+faststart',
+      '-an',
+      str(out_path),
+  ]
+  try:
+    import subprocess
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if result.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
+      print(f'🎬 已轉成 H.264: {out_path.name}')
+      return out_path
+    print(f'⚠️ ffmpeg 轉檔失敗，改傳原影片。stderr: {result.stderr[-300:]}')
+  except FileNotFoundError:
+    print('⚠️ 未安裝 ffmpeg，影片可能無法在 LINE 播放（建議: sudo apt install -y ffmpeg）')
+  except Exception as e:
+    print(f'⚠️ ffmpeg 轉檔例外: {e}')
+  return video_path
+
+
+def resolve_image_urls(original_path: Path, preview_path: Path) -> tuple[str | None, str | None]:
+  """
+  照片網址優先序：
+  1) ImgBB（若有 key）
+  2) catbox 直連上傳（對 LINE 通常比 cloudflared quick tunnel 穩）
+  3) PUBLIC_BASE_URL 本機隧道
+  """
+  # 1) ImgBB
+  original_url = upload_to_imgbb(original_path)
+  preview_url = upload_to_imgbb(preview_path)
   if original_url and preview_url:
     return original_url, preview_url
+  if preview_url and not original_url:
+    return preview_url, preview_url
+  if original_url and not preview_url:
+    return original_url, original_url
 
-  # 備援：ImgBB（preview 可重用同一張較小圖）
-  uploaded = upload_to_imgbb(preview_path) or upload_to_imgbb(original_path)
-  if uploaded:
-    return uploaded, uploaded
+  # 2) catbox
+  original_url = upload_to_catbox(original_path)
+  preview_url = upload_to_catbox(preview_path)
+  if original_url and preview_url:
+    return original_url, preview_url
+  if original_url:
+    return original_url, original_url
+  if preview_url:
+    return preview_url, preview_url
+
+  # 3) 本機隧道（cloudflared / ngrok）— 有時 LINE 抓不到
+  original_url = public_media_url(original_path)
+  preview_url = public_media_url(preview_path)
+  if original_url and preview_url:
+    print(f'🔗 使用隧道照片網址: {original_url}')
+    return original_url, preview_url
 
   return None, None
+
+
+def resolve_video_url(video_path: Path, preview_url: str | None) -> str | None:
+  """影片：先轉 H.264，再 catbox；失敗才用隧道。"""
+  if not preview_url:
+    return None
+  ready = ensure_line_h264_mp4(video_path)
+  if ready is None:
+    return None
+
+  uploaded = upload_to_catbox(ready)
+  if uploaded:
+    return uploaded
+
+  tunnel = public_media_url(ready)
+  if tunnel:
+    print(f'🔗 使用隧道影片網址: {tunnel}')
+  return tunnel
 
 
 def send_line_messages(messages: list[dict]) -> bool:
@@ -205,9 +304,8 @@ def send_fall_alert(
     )
 
   if video_path and video_path.exists():
-    video_url = public_media_url(video_path)
+    video_url = resolve_video_url(video_path, preview_url)
     if video_url and preview_url:
-      # LINE video：MP4 + HTTPS，並需要預覽圖
       messages.append(
           {
               'type': 'video',
@@ -217,10 +315,11 @@ def send_fall_alert(
       )
       print(f'🎬 將附帶跌倒影片: {video_url}')
     else:
-      print(
-          '⚠️ 影片已保留在本機，但 LINE 影片訊息需要 PUBLIC_BASE_URL（HTTPS）。'
-          f' 路徑: {video_path}'
-      )
+      print(f'⚠️ 影片已保留在本機，但無法產生 LINE 可讀網址。路徑: {video_path}')
+
+  if len(messages) > 1:
+    for i, msg in enumerate(messages[1:], start=1):
+      print(f'📎 LINE 媒體[{i}]: {msg.get("type")} -> {msg.get("originalContentUrl")}')
 
   # LINE 單次最多 5 則
   send_line_messages(messages[:5])
@@ -554,7 +653,21 @@ def media_files(subpath: str):
   events_root = (BASE_DIR / 'events').resolve()
   if not str(target).startswith(str(events_root)) or not target.is_file():
     return 'Not Found', 404
-  return send_from_directory(target.parent, target.name)
+
+  suffix = target.suffix.lower()
+  mime = {
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.png': 'image/png',
+      '.mp4': 'video/mp4',
+      '.avi': 'video/x-msvideo',
+  }.get(suffix)
+  return send_from_directory(
+      target.parent,
+      target.name,
+      mimetype=mime,
+      conditional=True,
+  )
 
 
 @app.route('/start_detection')
