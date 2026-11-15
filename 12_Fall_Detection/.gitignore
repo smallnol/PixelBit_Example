@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+yolov8*.pt
+events/pending/*
+events/confirmed/*
+!events/pending/.gitkeep
+!events/confirmed/.gitkeep
+fall_event.jpg
+*.mp4
+*.avi
+!static/.gitkeep
