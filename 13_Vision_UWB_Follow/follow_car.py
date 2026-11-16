@@ -37,13 +37,22 @@ CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
 HOST = os.getenv('HOST', '0.0.0.0')
 PORT = int(os.getenv('PORT', '5001'))
 
-# 車上 ESP32 USB（距離），例如 /dev/ttyUSB0
+# 車上 ESP32 USB（距離 + 馬達命令轉發），例如 /dev/ttyUSB0
 UWB_SERIAL_PORT = os.getenv('UWB_SERIAL_PORT', '/dev/ttyUSB0').strip()
 UWB_BAUD = int(os.getenv('UWB_BAUD', '115200'))
 
-# Pi → UNO（馬達），例如 /dev/ttyUSB1 或 /dev/ttyAMA0
-MOTOR_SERIAL_PORT = os.getenv('MOTOR_SERIAL_PORT', '/dev/ttyUSB1').strip()
-MOTOR_BAUD = int(os.getenv('MOTOR_BAUD', '9600'))
+# 馬達命令出口：
+# - 建議（無 USB-TTL）：填與 UWB 相同，例如 /dev/ttyUSB0
+#   → Pi 經 USB 把 F/L/R/Z 寫給車上 ESP32，再轉 Serial2 → UNO
+# - 或填 uwb / same 代表共用 UWB 口
+# - 進階：另開 /dev/ttyAMA0 或 USB-TTL
+_motor_port_raw = os.getenv('MOTOR_SERIAL_PORT', UWB_SERIAL_PORT).strip()
+if _motor_port_raw.lower() in {'', 'uwb', 'same', 'auto'}:
+  MOTOR_SERIAL_PORT = UWB_SERIAL_PORT
+else:
+  MOTOR_SERIAL_PORT = _motor_port_raw
+MOTOR_BAUD = int(os.getenv('MOTOR_BAUD', str(UWB_BAUD if MOTOR_SERIAL_PORT == UWB_SERIAL_PORT else 9600)))
+MOTOR_VIA_UWB = MOTOR_SERIAL_PORT == UWB_SERIAL_PORT
 
 # --- 跟隨參數 ---
 START_DIST = float(os.getenv('START_DIST', '2.0'))
@@ -80,12 +89,13 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
 
 class SerialReader:
-  """背景讀取 UWB 距離行。"""
+  """背景讀取 UWB 距離行；可與馬達命令共用同一 USB 口。"""
 
   def __init__(self, port: str, baud: int):
     self.port = port
     self.baud = baud
     self._ser: serial.Serial | None = None
+    self._io_lock = threading.Lock()
     self._stop = threading.Event()
     self._thread: threading.Thread | None = None
     self.ok = False
@@ -97,11 +107,12 @@ class SerialReader:
 
   def close(self) -> None:
     self._stop.set()
-    if self._ser and self._ser.is_open:
-      try:
-        self._ser.close()
-      except Exception:
-        pass
+    with self._io_lock:
+      if self._ser and self._ser.is_open:
+        try:
+          self._ser.close()
+        except Exception:
+          pass
 
   def _open(self) -> bool:
     try:
@@ -116,15 +127,44 @@ class SerialReader:
       print(f'⚠️ 無法開啟 UWB Serial ({self.port}): {e}')
       return False
 
+  def write_cmd(self, cmd: str) -> bool:
+    """寫入單字母馬達命令（供共用 USB 轉發）。"""
+    payload = f'{cmd}\n'.encode('ascii')
+    with self._io_lock:
+      if self._ser is None or not self._ser.is_open:
+        if not self._open():
+          return False
+      try:
+        self._ser.write(payload)
+        self._ser.flush()
+        return True
+      except Exception as e:
+        self.ok = False
+        self.last_error = str(e)
+        print(f'⚠️ UWB Serial 寫入命令失敗: {e}')
+        try:
+          if self._ser:
+            self._ser.close()
+        except Exception:
+          pass
+        self._ser = None
+        return False
+
   def _run(self) -> None:
     global latest_distance, last_distance_time
     while not self._stop.is_set():
-      if self._ser is None or not self._ser.is_open:
-        if not self._open():
+      with self._io_lock:
+        need_open = self._ser is None or not self._ser.is_open
+      if need_open:
+        with self._io_lock:
+          if not self._open():
+            pass
+        if not self.ok:
           time.sleep(2.0)
           continue
       try:
-        raw = self._ser.readline()
+        with self._io_lock:
+          raw = self._ser.readline() if self._ser else b''
         if not raw:
           continue
         line = raw.decode('utf-8', errors='ignore').strip()
@@ -142,34 +182,46 @@ class SerialReader:
         self.ok = False
         self.last_error = str(e)
         print(f'⚠️ UWB Serial 讀取錯誤: {e}')
-        try:
-          if self._ser:
-            self._ser.close()
-        except Exception:
-          pass
-        self._ser = None
+        with self._io_lock:
+          try:
+            if self._ser:
+              self._ser.close()
+          except Exception:
+            pass
+          self._ser = None
         time.sleep(1.0)
 
 
 class MotorCommander:
-  """對 UNO 送單字母命令。"""
+  """送馬達命令：可走獨立口，或共用 UWB USB（經 ESP32 轉 UNO）。"""
 
-  def __init__(self, port: str, baud: int):
+  def __init__(self, port: str, baud: int, shared_uwb: SerialReader | None = None):
     self.port = port
     self.baud = baud
+    self._shared_uwb = shared_uwb
     self._ser: serial.Serial | None = None
     self.ok = False
     self.last_error = ''
     self._last_sent = ''
     self._last_sent_at = 0.0
+    self.via_uwb = shared_uwb is not None
 
   def open(self) -> bool:
+    if self._shared_uwb is not None:
+      # 等 UWB 口開啟；以寫入測試視為就緒
+      ok = self._shared_uwb.write_cmd('S')
+      self.ok = ok
+      self.last_error = '' if ok else self._shared_uwb.last_error
+      if ok:
+        print(f'✅ Motor 經 UWB USB 轉發: {self.port} @ {self.baud}')
+      else:
+        print(f'⚠️ Motor 經 UWB 轉發尚未就緒: {self.last_error}')
+      return ok
     try:
       self._ser = serial.Serial(self.port, self.baud, timeout=0.1)
       self.ok = True
       self.last_error = ''
       print(f'✅ Motor Serial 已開: {self.port} @ {self.baud}')
-      # 開機先停住
       self.send('S', force=True)
       return True
     except Exception as e:
@@ -183,6 +235,8 @@ class MotorCommander:
       self.send('X', force=True)
     except Exception:
       pass
+    if self._shared_uwb is not None:
+      return
     if self._ser and self._ser.is_open:
       try:
         self._ser.close()
@@ -192,13 +246,24 @@ class MotorCommander:
   def send(self, cmd: str, force: bool = False) -> None:
     cmd = (cmd or 'S').upper()[:1]
     now = time.time()
-    # 同樣命令也定期重送，餵 UNO watchdog
     if (
         not force
         and cmd == self._last_sent
         and (now - self._last_sent_at) < CMD_INTERVAL_SECONDS
     ):
       return
+
+    if self._shared_uwb is not None:
+      if self._shared_uwb.write_cmd(cmd):
+        self._last_sent = cmd
+        self._last_sent_at = now
+        self.ok = True
+        self.last_error = ''
+      else:
+        self.ok = False
+        self.last_error = self._shared_uwb.last_error
+      return
+
     if self._ser is None or not self._ser.is_open:
       if not self.open():
         return
@@ -221,7 +286,15 @@ class MotorCommander:
 
 
 uwb_reader = SerialReader(UWB_SERIAL_PORT, UWB_BAUD)
-motor = MotorCommander(MOTOR_SERIAL_PORT, MOTOR_BAUD)
+motor = MotorCommander(
+    MOTOR_SERIAL_PORT,
+    MOTOR_BAUD,
+    shared_uwb=uwb_reader if MOTOR_VIA_UWB else None,
+)
+print(
+    f'🔧 馬達出口: {MOTOR_SERIAL_PORT}'
+    + ('（經車上 ESP32 USB→Serial2→UNO）' if MOTOR_VIA_UWB else '（獨立序列埠）')
+)
 
 
 def decide_command(
@@ -526,6 +599,8 @@ def status():
             'uwb_error': uwb_reader.last_error,
             'motor_ok': motor.ok,
             'motor_error': motor.last_error,
+            'motor_via_uwb': motor.via_uwb,
+            'motor_port': MOTOR_SERIAL_PORT,
         }
     )
 
