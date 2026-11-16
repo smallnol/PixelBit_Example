@@ -255,6 +255,9 @@ class MotorCommander:
 
     if self._shared_uwb is not None:
       if self._shared_uwb.write_cmd(cmd):
+        # 只在命令變化時印，避免刷屏
+        if cmd != self._last_sent:
+          print(f'📤 經 USB 送馬達命令 -> ESP32: {cmd}')
         self._last_sent = cmd
         self._last_sent_at = now
         self.ok = True
