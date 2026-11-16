@@ -31,6 +31,7 @@ from ultralytics import YOLO
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / '.env')
+APP_VERSION = 'follow-2026-03-16-ctrl-loop'
 
 # --- 硬體 / 網路 ---
 CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
@@ -432,11 +433,12 @@ def control_loop() -> None:
   """獨立控制迴圈：不依賴瀏覽器有沒有在看影像，都會送馬達命令。"""
   global latest_cmd, latest_status, person_offset, person_seen, was_forward, latest_jpeg
 
+  print('=== CONTROL LOOP THREAD ENTER ===', flush=True)
   if not cap.isOpened():
-    print('錯誤：無法開啟攝影機！')
+    print('=== CAMERA NOT OPEN — control loop exit ===', flush=True)
     return
 
-  print('🎮 控制迴圈已啟動（跟隨命令不依賴 /video_feed）')
+  print('=== CONTROL LOOP RUNNING (motor cmds independent of video_feed) ===', flush=True)
   while not control_stop.is_set():
     ok, frame = cap.read()
     if not ok:
@@ -650,11 +652,16 @@ def status():
 
 
 if __name__ == '__main__':
+  print(f'=== APP_VERSION={APP_VERSION} ===', flush=True)
+  print(f'=== FILE={Path(__file__).resolve()} ===', flush=True)
   uwb_reader.start()
   motor.open()
-  control_thread = threading.Thread(target=control_loop, daemon=True)
+  print('=== STARTING CONTROL THREAD ===', flush=True)
+  control_thread = threading.Thread(target=control_loop, name='control_loop', daemon=True)
   control_thread.start()
-  print(f'🌐 開啟 http://<樹莓派IP>:{PORT}')
+  time.sleep(0.5)
+  print(f'=== CONTROL THREAD ALIVE={control_thread.is_alive()} ===', flush=True)
+  print(f'🌐 開啟 http://<樹莓派IP>:{PORT}', flush=True)
   try:
     app.run(host=HOST, port=PORT, threaded=True, use_reloader=False)
   finally:
