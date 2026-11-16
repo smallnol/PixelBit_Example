@@ -33,14 +33,18 @@ UNO + BMP73T104：只聽 Pi 命令，不再直接讀 UWB
 
 1. **車上 ESP32 USB → 樹莓派**（預設 `/dev/ttyUSB0`）  
    讀距離行：`D:1.85`
-2. **USB-TTL（或 GPIO UART）TX → UNO D10**，**GND 共地**（預設 `/dev/ttyUSB1` @ 9600）  
-   送命令：`F` / `L` / `R` / `Z` / `S` / `X`
+2. **馬達命令接到 UNO D10**（二選一）  
+   - **沒有 USB-TTL（建議 Pi 5）**：GPIO **腳 8 TX → UNO D10**，**腳 6 GND → UNO GND**  
+     `.env` 填 `MOTOR_SERIAL_PORT=/dev/ttyAMA0`  
+     並在 `/boot/firmware/config.txt` 加一行 `dtparam=uart0=on` 後重開  
+     （**不要**用 `/dev/serial0`：Pi 5 常連到 `ttyAMA10` 除錯座，不是腳 8）  
+   - **有 USB-TTL**：TX → UNO D10，GND 共地，`.env` 填 `/dev/ttyUSB1`
 3. 燒錄 `uwb-follow-car` 的新版：
    - `uwb_car_responder/`（輸出 `D:xx.xx`）
    - `uno_car/`（Pi-slave 馬達）
    - `uwb_tag_initiator/`（人身上，不變）
 
-用 `ls /dev/ttyUSB*` / `dmesg` 確認哪個是 ESP32、哪個是 USB-TTL，再寫进 `.env`。
+用 `ls /dev/ttyUSB*` / `ls /dev/ttyAMA0` 確認裝置後再寫進 `.env`。
 
 ## 安裝
 
