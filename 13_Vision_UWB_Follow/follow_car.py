@@ -232,34 +232,37 @@ def decide_command(
     following: bool,
     prev_forward: bool,
 ) -> tuple[str, str, bool]:
-  """回傳 (cmd, status_text, next_was_forward)。"""
+  """回傳 (cmd, status_text, next_was_forward)。
+
+  status_text 用英文（OpenCV 畫面字型不支援中文，避免 ??? 重影）。
+  """
   if not following:
-    return 'S', '跟隨關閉（僅預覽）', False
+    return 'S', 'follow OFF (preview)', False
 
   dist_ok = distance is not None and dist_age <= UWB_STALE_SECONDS
 
   if not has_person:
     # 找不到人：自轉搜尋（不依賴距離）；結束前進狀態
-    return 'Z', '搜尋中：畫面無人 → 自轉', False
+    return 'Z', 'search: no person -> spin', False
 
   if offset < -CENTER_DEADZONE:
-    return 'L', f'左轉置中（offset={offset:+.2f}）', prev_forward
+    return 'L', f'turn LEFT (offset={offset:+.2f})', prev_forward
   if offset > CENTER_DEADZONE:
-    return 'R', f'右轉置中（offset={offset:+.2f}）', prev_forward
+    return 'R', f'turn RIGHT (offset={offset:+.2f})', prev_forward
 
   # 已置中 → 用 UWB 決定前進／停止
   if not dist_ok:
-    return 'S', '已置中但 UWB 距離失效 → 停止', False
+    return 'S', 'centered but UWB stale -> stop', False
 
   assert distance is not None
   if distance >= START_DIST:
-    return 'F', f'置中且距離 {distance:.2f}m ≥ {START_DIST:.1f} → 前進', True
+    return 'F', f'centered dist {distance:.2f}m -> forward', True
   if distance < STOP_DIST:
-    return 'S', f'置中且距離 {distance:.2f}m < {STOP_DIST:.1f} → 停止', False
+    return 'S', f'centered dist {distance:.2f}m -> stop', False
   # 1.8～2.0：維持上一前進／停止（與舊 UWB 直線跟隨相同）
   if prev_forward:
-    return 'F', f'置中且距離 {distance:.2f}m 緩衝帶 → 維持前進', True
-  return 'S', f'置中且距離 {distance:.2f}m 緩衝帶 → 維持停止', False
+    return 'F', f'centered band {distance:.2f}m -> keep F', True
+  return 'S', f'centered band {distance:.2f}m -> keep S', False
 
 
 def person_from_result(result) -> tuple[bool, float, tuple[int, int, int, int] | None]:
@@ -318,17 +321,19 @@ def draw_hud(
       f'FOLLOW: {"ON" if following else "OFF"}  CMD: {cmd}',
       dist_txt,
       f'offset: {offset:+.2f}' if has_person else 'person: none',
-      status[:48],
+      status[:52],
   ]
-  y = 24
+  # 單一底色條 + 單層白字，避免黑白雙描邊造成「重影」
+  bar_h = 18 + 20 * len(lines)
+  overlay = frame.copy()
+  cv2.rectangle(overlay, (0, 0), (w, bar_h), (0, 0, 0), -1)
+  cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
+  y = 22
   for line in lines:
-    cv2.putText(
-        frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA
-    )
     cv2.putText(
         frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA
     )
-    y += 22
+    y += 20
   return frame
 
 
@@ -350,7 +355,8 @@ def generate_frames():
         frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
 
       results = model.predict(source=frame, imgsz=YOLO_IMGSZ, conf=0.5, verbose=False)
-      annotated = results[0].plot()
+      # 不畫 YOLO 標籤／信心分數，避免與 HUD 疊成重影；骨架保留
+      annotated = results[0].plot(labels=False, conf=False)
       has_person, offset, bbox = person_from_result(results[0])
 
       with state_lock:
