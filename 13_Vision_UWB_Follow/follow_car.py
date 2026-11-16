@@ -46,12 +46,24 @@ UWB_BAUD = int(os.getenv('UWB_BAUD', '115200'))
 #   → Pi 經 USB 把 F/L/R/Z 寫給車上 ESP32，再轉 Serial2 → UNO
 # - 或填 uwb / same 代表共用 UWB 口
 # - 進階：另開 /dev/ttyAMA0 或 USB-TTL
-_motor_port_raw = os.getenv('MOTOR_SERIAL_PORT', UWB_SERIAL_PORT).strip()
-if _motor_port_raw.lower() in {'', 'uwb', 'same', 'auto'}:
+_motor_port_raw = os.getenv('MOTOR_SERIAL_PORT', 'uwb').strip()
+# Pi 5 的 serial0/ttyAMA0 常不是接到 UNO；無 USB-TTL 時一律走 UWB USB 轉發
+_pi5_trap = {'/dev/serial0', '/dev/ttyama0', '/dev/ttyama10', 'serial0', 'ttyama0'}
+if _motor_port_raw.lower() in {'', 'uwb', 'same', 'auto'} or _motor_port_raw.lower() in _pi5_trap:
+  if _motor_port_raw and _motor_port_raw.lower() not in {'', 'uwb', 'same', 'auto'}:
+    print(
+        f'⚠️ MOTOR_SERIAL_PORT={_motor_port_raw} 在無 USB-TTL 架構下不可靠，'
+        f'改走 UWB USB 轉發 ({UWB_SERIAL_PORT})'
+    )
   MOTOR_SERIAL_PORT = UWB_SERIAL_PORT
 else:
   MOTOR_SERIAL_PORT = _motor_port_raw
-MOTOR_BAUD = int(os.getenv('MOTOR_BAUD', str(UWB_BAUD if MOTOR_SERIAL_PORT == UWB_SERIAL_PORT else 9600)))
+MOTOR_BAUD = int(
+    os.getenv(
+        'MOTOR_BAUD',
+        str(UWB_BAUD if MOTOR_SERIAL_PORT == UWB_SERIAL_PORT else 9600),
+    )
+)
 MOTOR_VIA_UWB = MOTOR_SERIAL_PORT == UWB_SERIAL_PORT
 
 # --- 跟隨參數 ---
@@ -570,8 +582,22 @@ def start_follow():
   global is_following
   with state_lock:
     is_following = True
-  print('▶️ 開啟跟隨')
-  return jsonify({'ok': True, 'following': True})
+  # 立刻送幾次，方便 UNO Monitor 確認有收到
+  for _ in range(5):
+    motor.send('Z', force=True)
+    time.sleep(0.05)
+  print(
+      f'▶️ 開啟跟隨｜馬達出口={MOTOR_SERIAL_PORT}'
+      f'｜via_uwb={MOTOR_VIA_UWB}｜已送測試 Z x5'
+  )
+  return jsonify(
+      {
+          'ok': True,
+          'following': True,
+          'motor_port': MOTOR_SERIAL_PORT,
+          'motor_via_uwb': MOTOR_VIA_UWB,
+      }
+  )
 
 
 @app.route('/stop_follow')
