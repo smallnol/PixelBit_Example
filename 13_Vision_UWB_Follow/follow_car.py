@@ -186,6 +186,9 @@ class SerialReader:
         line = raw.decode('utf-8', errors='ignore').strip()
         if not line:
           continue
+        # ESP32 轉發成功時會印 FWD->UNO X；顯示在 Pi 終端方便除錯
+        if 'FWD' in line.upper() or line.upper().startswith('CMD'):
+          print(f'📥 ESP32: {line}', flush=True)
         m = DIST_LINE_RE.search(line) or DIST_LEGACY_RE.search(line)
         if not m:
           continue
