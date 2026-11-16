@@ -92,6 +92,9 @@ latest_status = '待機'
 person_offset = 0.0  # -1 左 … 0 中 … +1 右
 person_seen = False
 was_forward = False  # 1.8～2.0m 緩衝帶用：維持上一前進／停止
+latest_jpeg: bytes | None = None
+jpeg_lock = threading.Lock()
+control_stop = threading.Event()
 
 print('正在載入 YOLO-pose...')
 model = YOLO('yolov8n-pose.pt')
@@ -425,14 +428,16 @@ def draw_hud(
   return frame
 
 
-def generate_frames():
-  global latest_cmd, latest_status, person_offset, person_seen, was_forward
+def control_loop() -> None:
+  """獨立控制迴圈：不依賴瀏覽器有沒有在看影像，都會送馬達命令。"""
+  global latest_cmd, latest_status, person_offset, person_seen, was_forward, latest_jpeg
 
   if not cap.isOpened():
     print('錯誤：無法開啟攝影機！')
     return
 
-  while True:
+  print('🎮 控制迴圈已啟動（跟隨命令不依賴 /video_feed）')
+  while not control_stop.is_set():
     ok, frame = cap.read()
     if not ok:
       time.sleep(0.05)
@@ -443,7 +448,6 @@ def generate_frames():
         frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
 
       results = model.predict(source=frame, imgsz=YOLO_IMGSZ, conf=0.5, verbose=False)
-      # 不畫 YOLO 標籤／信心分數，避免與 HUD 疊成重影；骨架保留
       annotated = results[0].plot(labels=False, conf=False)
       has_person, offset, bbox = person_from_result(results[0])
 
@@ -460,7 +464,6 @@ def generate_frames():
       if following:
         motor.send(cmd)
       else:
-        # 關閉跟隨時確保停下（只在剛切換或定期）
         motor.send('S')
         next_forward = False
 
@@ -483,14 +486,26 @@ def generate_frames():
           following,
       )
       ret, jpg = cv2.imencode('.jpg', hud)
-      if not ret:
-        continue
-      yield (
-          b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpg.tobytes() + b'\r\n'
-      )
+      if ret:
+        with jpeg_lock:
+          latest_jpeg = jpg.tobytes()
     except Exception as e:
-      print(f'發生例外: {e}')
+      print(f'控制迴圈例外: {e}')
       time.sleep(0.1)
+
+
+def generate_frames():
+  """只負責把控制迴圈產出的畫面推給瀏覽器。"""
+  while not control_stop.is_set():
+    with jpeg_lock:
+      frame = latest_jpeg
+    if frame is None:
+      time.sleep(0.05)
+      continue
+    yield (
+        b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame + b'\r\n'
+    )
+    time.sleep(0.05)
 
 
 INDEX_HTML = """
@@ -637,10 +652,13 @@ def status():
 if __name__ == '__main__':
   uwb_reader.start()
   motor.open()
+  control_thread = threading.Thread(target=control_loop, daemon=True)
+  control_thread.start()
   print(f'🌐 開啟 http://<樹莓派IP>:{PORT}')
   try:
-    app.run(host=HOST, port=PORT, threaded=True)
+    app.run(host=HOST, port=PORT, threaded=True, use_reloader=False)
   finally:
+    control_stop.set()
     motor.close()
     uwb_reader.close()
     cap.release()
