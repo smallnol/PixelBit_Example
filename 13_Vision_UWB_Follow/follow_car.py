@@ -1,0 +1,536 @@
+"""
+樹莓派 5｜視覺 + UWB 跟隨小車
+
+控制邏輯（Pi 當大腦）：
+1. YOLO-pose 找人體 → 用 bbox 中心判斷在畫面左／中／右
+2. 車上 ESP32-UWB 報距離（Serial 行：D:1.85）
+3. 綜合決策後對 UNO 下馬達命令：
+   - 找不到人 → Z（自轉搜尋）
+   - 人在左側 → L（左轉直到置中）
+   - 人在右側 → R（右轉直到置中）
+   - 人在中央且距離 ≥ START_DIST → F（前進）
+   - 人在中央且距離 < STOP_DIST → S（停止）
+   - 距離失效／逾時 → S（安全停止；搜尋中仍可自轉）
+
+預設只開預覽；按「開啟跟隨」才會送馬達命令。
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import threading
+import time
+from pathlib import Path
+
+import cv2
+import serial
+from dotenv import load_dotenv
+from flask import Flask, Response, jsonify, render_template_string
+from ultralytics import YOLO
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / '.env')
+
+# --- 硬體 / 網路 ---
+CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
+HOST = os.getenv('HOST', '0.0.0.0')
+PORT = int(os.getenv('PORT', '5001'))
+
+# 車上 ESP32 USB（距離），例如 /dev/ttyUSB0
+UWB_SERIAL_PORT = os.getenv('UWB_SERIAL_PORT', '/dev/ttyUSB0').strip()
+UWB_BAUD = int(os.getenv('UWB_BAUD', '115200'))
+
+# Pi → UNO（馬達），例如 /dev/ttyUSB1 或 /dev/ttyAMA0
+MOTOR_SERIAL_PORT = os.getenv('MOTOR_SERIAL_PORT', '/dev/ttyUSB1').strip()
+MOTOR_BAUD = int(os.getenv('MOTOR_BAUD', '9600'))
+
+# --- 跟隨參數 ---
+START_DIST = float(os.getenv('START_DIST', '2.0'))
+STOP_DIST = float(os.getenv('STOP_DIST', '1.8'))
+# 畫面中央死區：±比例內視為「置中」（0.12 = 左右各 12%）
+CENTER_DEADZONE = float(os.getenv('CENTER_DEADZONE', '0.12'))
+UWB_STALE_SECONDS = float(os.getenv('UWB_STALE_SECONDS', '1.0'))
+CMD_INTERVAL_SECONDS = float(os.getenv('CMD_INTERVAL_SECONDS', '0.15'))
+FRAME_WIDTH = int(os.getenv('FRAME_WIDTH', '640'))
+FRAME_HEIGHT = int(os.getenv('FRAME_HEIGHT', '480'))
+YOLO_IMGSZ = int(os.getenv('YOLO_IMGSZ', '320'))
+
+DIST_LINE_RE = re.compile(r'D:\s*([0-9]+(?:\.[0-9]+)?)', re.IGNORECASE)
+# 相容舊格式 [CAR] 1.85 m
+DIST_LEGACY_RE = re.compile(r'\[CAR\]\s*([0-9]+(?:\.[0-9]+)?)\s*m', re.IGNORECASE)
+
+app = Flask(__name__)
+
+state_lock = threading.Lock()
+is_following = False
+latest_distance: float | None = None
+last_distance_time = 0.0
+latest_cmd = 'S'
+latest_status = '待機'
+person_offset = 0.0  # -1 左 … 0 中 … +1 右
+person_seen = False
+was_forward = False  # 1.8～2.0m 緩衝帶用：維持上一前進／停止
+
+print('正在載入 YOLO-pose...')
+model = YOLO('yolov8n-pose.pt')
+cap = cv2.VideoCapture(CAMERA_INDEX)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+
+
+class SerialReader:
+  """背景讀取 UWB 距離行。"""
+
+  def __init__(self, port: str, baud: int):
+    self.port = port
+    self.baud = baud
+    self._ser: serial.Serial | None = None
+    self._stop = threading.Event()
+    self._thread: threading.Thread | None = None
+    self.ok = False
+    self.last_error = ''
+
+  def start(self) -> None:
+    self._thread = threading.Thread(target=self._run, daemon=True)
+    self._thread.start()
+
+  def close(self) -> None:
+    self._stop.set()
+    if self._ser and self._ser.is_open:
+      try:
+        self._ser.close()
+      except Exception:
+        pass
+
+  def _open(self) -> bool:
+    try:
+      self._ser = serial.Serial(self.port, self.baud, timeout=0.2)
+      self.ok = True
+      self.last_error = ''
+      print(f'✅ UWB Serial 已開: {self.port} @ {self.baud}')
+      return True
+    except Exception as e:
+      self.ok = False
+      self.last_error = str(e)
+      print(f'⚠️ 無法開啟 UWB Serial ({self.port}): {e}')
+      return False
+
+  def _run(self) -> None:
+    global latest_distance, last_distance_time
+    while not self._stop.is_set():
+      if self._ser is None or not self._ser.is_open:
+        if not self._open():
+          time.sleep(2.0)
+          continue
+      try:
+        raw = self._ser.readline()
+        if not raw:
+          continue
+        line = raw.decode('utf-8', errors='ignore').strip()
+        if not line:
+          continue
+        m = DIST_LINE_RE.search(line) or DIST_LEGACY_RE.search(line)
+        if not m:
+          continue
+        dist = float(m.group(1))
+        if 0.05 < dist < 40.0:
+          with state_lock:
+            latest_distance = dist
+            last_distance_time = time.time()
+      except Exception as e:
+        self.ok = False
+        self.last_error = str(e)
+        print(f'⚠️ UWB Serial 讀取錯誤: {e}')
+        try:
+          if self._ser:
+            self._ser.close()
+        except Exception:
+          pass
+        self._ser = None
+        time.sleep(1.0)
+
+
+class MotorCommander:
+  """對 UNO 送單字母命令。"""
+
+  def __init__(self, port: str, baud: int):
+    self.port = port
+    self.baud = baud
+    self._ser: serial.Serial | None = None
+    self.ok = False
+    self.last_error = ''
+    self._last_sent = ''
+    self._last_sent_at = 0.0
+
+  def open(self) -> bool:
+    try:
+      self._ser = serial.Serial(self.port, self.baud, timeout=0.1)
+      self.ok = True
+      self.last_error = ''
+      print(f'✅ Motor Serial 已開: {self.port} @ {self.baud}')
+      # 開機先停住
+      self.send('S', force=True)
+      return True
+    except Exception as e:
+      self.ok = False
+      self.last_error = str(e)
+      print(f'⚠️ 無法開啟 Motor Serial ({self.port}): {e}')
+      return False
+
+  def close(self) -> None:
+    try:
+      self.send('X', force=True)
+    except Exception:
+      pass
+    if self._ser and self._ser.is_open:
+      try:
+        self._ser.close()
+      except Exception:
+        pass
+
+  def send(self, cmd: str, force: bool = False) -> None:
+    cmd = (cmd or 'S').upper()[:1]
+    now = time.time()
+    # 同樣命令也定期重送，餵 UNO watchdog
+    if (
+        not force
+        and cmd == self._last_sent
+        and (now - self._last_sent_at) < CMD_INTERVAL_SECONDS
+    ):
+      return
+    if self._ser is None or not self._ser.is_open:
+      if not self.open():
+        return
+    try:
+      self._ser.write(f'{cmd}\n'.encode('ascii'))
+      self._ser.flush()
+      self._last_sent = cmd
+      self._last_sent_at = now
+      self.ok = True
+    except Exception as e:
+      self.ok = False
+      self.last_error = str(e)
+      print(f'⚠️ 送馬達命令失敗: {e}')
+      try:
+        if self._ser:
+          self._ser.close()
+      except Exception:
+        pass
+      self._ser = None
+
+
+uwb_reader = SerialReader(UWB_SERIAL_PORT, UWB_BAUD)
+motor = MotorCommander(MOTOR_SERIAL_PORT, MOTOR_BAUD)
+
+
+def decide_command(
+    has_person: bool,
+    offset: float,
+    distance: float | None,
+    dist_age: float,
+    following: bool,
+    prev_forward: bool,
+) -> tuple[str, str, bool]:
+  """回傳 (cmd, status_text, next_was_forward)。"""
+  if not following:
+    return 'S', '跟隨關閉（僅預覽）', False
+
+  dist_ok = distance is not None and dist_age <= UWB_STALE_SECONDS
+
+  if not has_person:
+    # 找不到人：自轉搜尋（不依賴距離）；結束前進狀態
+    return 'Z', '搜尋中：畫面無人 → 自轉', False
+
+  if offset < -CENTER_DEADZONE:
+    return 'L', f'左轉置中（offset={offset:+.2f}）', prev_forward
+  if offset > CENTER_DEADZONE:
+    return 'R', f'右轉置中（offset={offset:+.2f}）', prev_forward
+
+  # 已置中 → 用 UWB 決定前進／停止
+  if not dist_ok:
+    return 'S', '已置中但 UWB 距離失效 → 停止', False
+
+  assert distance is not None
+  if distance >= START_DIST:
+    return 'F', f'置中且距離 {distance:.2f}m ≥ {START_DIST:.1f} → 前進', True
+  if distance < STOP_DIST:
+    return 'S', f'置中且距離 {distance:.2f}m < {STOP_DIST:.1f} → 停止', False
+  # 1.8～2.0：維持上一前進／停止（與舊 UWB 直線跟隨相同）
+  if prev_forward:
+    return 'F', f'置中且距離 {distance:.2f}m 緩衝帶 → 維持前進', True
+  return 'S', f'置中且距離 {distance:.2f}m 緩衝帶 → 維持停止', False
+
+
+def person_from_result(result) -> tuple[bool, float, tuple[int, int, int, int] | None]:
+  """回傳 (seen, offset[-1..1], bbox xyxy int)。"""
+  if result.boxes is None or len(result.boxes) == 0:
+    return False, 0.0, None
+
+  # 取信心最高的一個人
+  boxes = result.boxes
+  conf = boxes.conf
+  best_i = int(conf.argmax().item()) if conf is not None and len(conf) else 0
+  xyxy = boxes.xyxy[best_i].tolist()
+  x1, y1, x2, y2 = xyxy
+  cx = (x1 + x2) / 2.0
+  frame_w = float(FRAME_WIDTH)
+  # -1 = 最左, 0 = 正中, +1 = 最右
+  offset = (cx / max(frame_w, 1.0)) * 2.0 - 1.0
+  bbox = (int(x1), int(y1), int(x2), int(y2))
+  return True, offset, bbox
+
+
+def draw_hud(
+    frame,
+    has_person: bool,
+    offset: float,
+    bbox: tuple[int, int, int, int] | None,
+    distance: float | None,
+    dist_age: float,
+    cmd: str,
+    status: str,
+    following: bool,
+):
+  h, w = frame.shape[:2]
+  cx = w // 2
+  # CENTER_DEADZONE = |offset| 閾值；offset ∈ [-1,1] → 像素半寬 = deadzone * (w/2)
+  half = int(CENTER_DEADZONE * (w / 2))
+
+  # 中央死區
+  cv2.line(frame, (cx - half, 0), (cx - half, h), (80, 80, 80), 1)
+  cv2.line(frame, (cx + half, 0), (cx + half, h), (80, 80, 80), 1)
+  cv2.line(frame, (cx, 0), (cx, h), (0, 255, 255), 1)
+
+  if has_person and bbox is not None:
+    x1, y1, x2, y2 = bbox
+    color = (0, 255, 0) if abs(offset) <= CENTER_DEADZONE else (0, 165, 255)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    pcx = (x1 + x2) // 2
+    cv2.circle(frame, (pcx, (y1 + y2) // 2), 5, color, -1)
+
+  dist_txt = 'UWB: --'
+  if distance is not None:
+    stale = ' (stale)' if dist_age > UWB_STALE_SECONDS else ''
+    dist_txt = f'UWB: {distance:.2f}m{stale}'
+
+  lines = [
+      f'FOLLOW: {"ON" if following else "OFF"}  CMD: {cmd}',
+      dist_txt,
+      f'offset: {offset:+.2f}' if has_person else 'person: none',
+      status[:48],
+  ]
+  y = 24
+  for line in lines:
+    cv2.putText(
+        frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA
+    )
+    cv2.putText(
+        frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA
+    )
+    y += 22
+  return frame
+
+
+def generate_frames():
+  global latest_cmd, latest_status, person_offset, person_seen, was_forward
+
+  if not cap.isOpened():
+    print('錯誤：無法開啟攝影機！')
+    return
+
+  while True:
+    ok, frame = cap.read()
+    if not ok:
+      time.sleep(0.05)
+      continue
+
+    try:
+      if frame.shape[1] != FRAME_WIDTH or frame.shape[0] != FRAME_HEIGHT:
+        frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+
+      results = model.predict(source=frame, imgsz=YOLO_IMGSZ, conf=0.5, verbose=False)
+      annotated = results[0].plot()
+      has_person, offset, bbox = person_from_result(results[0])
+
+      with state_lock:
+        following = is_following
+        distance = latest_distance
+        dist_age = time.time() - last_distance_time if last_distance_time else 999.0
+        prev_forward = was_forward
+
+      cmd, status, next_forward = decide_command(
+          has_person, offset, distance, dist_age, following, prev_forward
+      )
+
+      if following:
+        motor.send(cmd)
+      else:
+        # 關閉跟隨時確保停下（只在剛切換或定期）
+        motor.send('S')
+        next_forward = False
+
+      with state_lock:
+        latest_cmd = cmd
+        latest_status = status
+        person_offset = offset
+        person_seen = has_person
+        was_forward = next_forward
+
+      hud = draw_hud(
+          annotated,
+          has_person,
+          offset,
+          bbox,
+          distance,
+          dist_age,
+          cmd,
+          status,
+          following,
+      )
+      ret, jpg = cv2.imencode('.jpg', hud)
+      if not ret:
+        continue
+      yield (
+          b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpg.tobytes() + b'\r\n'
+      )
+    except Exception as e:
+      print(f'發生例外: {e}')
+      time.sleep(0.1)
+
+
+INDEX_HTML = """
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>視覺 + UWB 跟隨</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: system-ui, sans-serif; margin: 0; background: #111; color: #eee; }
+    main { max-width: 960px; margin: 0 auto; padding: 16px; }
+    h1 { font-size: 1.25rem; margin: 0 0 12px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+    button {
+      border: 0; border-radius: 8px; padding: 10px 14px; font-size: 1rem; cursor: pointer;
+    }
+    .on { background: #1f8f4e; color: #fff; }
+    .off { background: #a33; color: #fff; }
+    .ghost { background: #333; color: #eee; }
+    img { width: 100%; background: #000; border-radius: 8px; }
+    #status {
+      margin-top: 10px; padding: 10px 12px; background: #1b1b1b; border-radius: 8px;
+      font-family: ui-monospace, monospace; white-space: pre-wrap; line-height: 1.45;
+    }
+    .hint { opacity: .75; font-size: .9rem; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>視覺 + UWB 跟隨小車</h1>
+    <div class="row">
+      <button class="on" onclick="api('/start_follow')">開啟跟隨</button>
+      <button class="off" onclick="api('/stop_follow')">停止跟隨</button>
+      <button class="ghost" onclick="refresh()">重新整理狀態</button>
+    </div>
+    <img src="/video_feed" alt="camera"/>
+    <div id="status">載入中…</div>
+    <p class="hint">
+      置中死區 ±{{ deadzone }}｜前進 ≥ {{ start }}m｜停止 &lt; {{ stop }}m<br/>
+      UWB: {{ uwb }}｜Motor: {{ motor }}
+    </p>
+  </main>
+  <script>
+    async function api(path) {
+      await fetch(path);
+      refresh();
+    }
+    async function refresh() {
+      const r = await fetch('/status');
+      const j = await r.json();
+      document.getElementById('status').textContent =
+        `跟隨: ${j.following ? 'ON' : 'OFF'}\\n` +
+        `命令: ${j.cmd}\\n` +
+        `距離: ${j.distance == null ? '--' : j.distance.toFixed(2) + ' m'} (age ${j.distance_age.toFixed(2)}s)\\n` +
+        `人體: ${j.person_seen ? 'yes' : 'no'}  offset=${j.offset.toFixed(2)}\\n` +
+        `UWB port: ${j.uwb_ok ? 'OK' : 'FAIL'} ${j.uwb_error}\\n` +
+        `Motor port: ${j.motor_ok ? 'OK' : 'FAIL'} ${j.motor_error}\\n` +
+        `狀態: ${j.status}`;
+    }
+    refresh();
+    setInterval(refresh, 500);
+  </script>
+</body>
+</html>
+"""
+
+
+@app.route('/')
+def index():
+  return render_template_string(
+      INDEX_HTML,
+      deadzone=CENTER_DEADZONE,
+      start=START_DIST,
+      stop=STOP_DIST,
+      uwb=UWB_SERIAL_PORT,
+      motor=MOTOR_SERIAL_PORT,
+  )
+
+
+@app.route('/video_feed')
+def video_feed():
+  return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.route('/start_follow')
+def start_follow():
+  global is_following
+  with state_lock:
+    is_following = True
+  print('▶️ 開啟跟隨')
+  return jsonify({'ok': True, 'following': True})
+
+
+@app.route('/stop_follow')
+def stop_follow():
+  global is_following
+  with state_lock:
+    is_following = False
+  motor.send('S', force=True)
+  print('⏹️ 停止跟隨')
+  return jsonify({'ok': True, 'following': False})
+
+
+@app.route('/status')
+def status():
+  with state_lock:
+    dist = latest_distance
+    age = time.time() - last_distance_time if last_distance_time else 999.0
+    return jsonify(
+        {
+            'following': is_following,
+            'cmd': latest_cmd,
+            'status': latest_status,
+            'distance': dist,
+            'distance_age': age,
+            'person_seen': person_seen,
+            'offset': person_offset,
+            'uwb_ok': uwb_reader.ok,
+            'uwb_error': uwb_reader.last_error,
+            'motor_ok': motor.ok,
+            'motor_error': motor.last_error,
+        }
+    )
+
+
+if __name__ == '__main__':
+  uwb_reader.start()
+  motor.open()
+  print(f'🌐 開啟 http://<樹莓派IP>:{PORT}')
+  try:
+    app.run(host=HOST, port=PORT, threaded=True)
+  finally:
+    motor.close()
+    uwb_reader.close()
+    cap.release()
