@@ -70,6 +70,38 @@ class AoaProtocolTest(unittest.TestCase):
     )
     self.assertEqual(cmd, 'L')
 
+  def test_decide_forward_and_stale(self):
+    from aoa_protocol import AoaSample
+
+    sample = AoaSample(distance_m=2.5, angle_deg=3.0)
+    cmd, _, fwd = decide_aoa_command(
+        following=True,
+        sample=sample,
+        age_s=0.1,
+        stale_s=1.0,
+        deadzone_deg=10,
+        start_dist=2.0,
+        stop_dist=1.8,
+        angle_sign=1.0,
+        prev_forward=False,
+    )
+    self.assertEqual(cmd, 'F')
+    self.assertTrue(fwd)
+
+    cmd2, _, _ = decide_aoa_command(
+        following=True,
+        sample=sample,
+        age_s=5.0,
+        stale_s=1.0,
+        deadzone_deg=10,
+        start_dist=2.0,
+        stop_dist=1.8,
+        angle_sign=1.0,
+        prev_forward=True,
+        lost_cmd='Z',
+    )
+    self.assertEqual(cmd2, 'Z')
+
 
 if __name__ == '__main__':
   unittest.main()
