@@ -1,4 +1,4 @@
-# MaUWB STM32 AOA 小車跟隨＋跌倒聯動
+# MaUWB STM32 AOA 小車跟隨＋跌倒結合
 
 ## 兩大功能
 
