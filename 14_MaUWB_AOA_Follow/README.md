@@ -1,51 +1,62 @@
 # MaUWB STM32 AOA 小車跟隨整合（架構規劃）
 
-> 目標：以 **MaUWB_STM32 AOA Development Kit** 取代 ESP32-UWB DS-TWR，作為跟隨主測距／方位來源。  
-> 過渡相機方案（`13_Vision_UWB_Follow`）保留為備用／融合，**不是刪除**。
+## 專題當前兩大功能
+
+| # | 功能 | 主感測／主算力 | 狀態 |
+|---|------|----------------|------|
+| 1 | **小車跟隨使用者** | MaUWB AOA 的**距離 + 角度** | 硬體改 AOA；套件未到前可用相機過渡 |
+| 2 | **跌倒偵測 + LINE 通報** | **樹莓派 5** 相機／YOLOv8-pose | 已大致完成（`12_Fall_Detection`） |
+
+> Pi 的**主責是跌倒偵測**。跟隨以 AOA 為準；若把 AOA 接上 Pi 做決策／與跌倒聯動（例如確認跌倒 → 小車 `X` 急停），或之後用相機輔助讓跟隨更穩，**可以留 Pi 在跟隨鏈路上**——不是要用 YOLO 取代 AOA。
 
 對應舊方案：
 
-| 項目 | 舊（過渡） | 新（AOA） |
+| 項目 | 舊（過渡） | 新（目標） |
 |------|------------|-----------|
-| 方位 | YOLO 畫面左／中／右 | Anchor PDOA 角度（±60°） |
-| 距離 | ESP32-UWB `D:1.85` | Anchor ToF `dist_cm` |
-| 馬達 | Pi → ESP32 USB → GPIO17 → UNO D10 | Pi →（獨立 Serial）→ UNO D10 |
-| 大腦 | 樹莓派 5 | **仍建議樹莓派 5** |
+| 跟隨方位 | YOLO 畫面左／中／右 | **AOA 角度** |
+| 跟隨距離 | ESP32-UWB `D:1.85` | **AOA ToF** |
+| 馬達 | Pi → ESP32 USB → GPIO17 → UNO D10 | Pi（或過渡轉發）→ UNO D10 |
+| Pi 主責 | 曾兼視覺跟隨大腦 | **跌倒偵測**；跟隨決策可掛在同一台 Pi |
 
 ---
 
-## 1. 建議總架構（Pi 當大腦）
+## 1. 建議總架構
 
 ```
-身上 Tag（MaUWB AOA Tag，鋰電／USB-TTL 供電）
-        │  UWB PDOA + ToF
-        ▼
-車上 Anchor（MaUWB AOA Anchor）
-        │  USB-Native（STM32 VCP）→ 距離 + 角度
-        ▼
-   樹莓派 5（follow 決策 + 跌倒偵測可並存）
-        │  馬達命令 F/L/R/Z/S/X
-        ▼
-   USB-TTL（或既有轉接板）TX → UNO D10（SoftwareSerial）
-        │
-        ▼
-   UNO R3 + BMP73T104（維持現有 Pi-slave 韌體）
+[功能 1 跟隨]
+  身上 Tag ──UWB──► 車上 Anchor ──USB（距離+角度）──► 樹莓派 5
+                                                      │ 解析 AOA → F/L/R/Z/S/X
+                                                      ▼
+                                              USB-TTL → UNO D10 → BMP73T104
+
+[功能 2 跌倒]
+  相機 ──► 樹莓派 5（YOLOv8-pose + Flask + LINE）
+              │ 確認跌倒時可順便送 X 急停（與跟隨共用命令口）
 ```
 
-### 為什麼仍用 Pi 當大腦（不建議 Anchor 直接控車）
+### 角色怎麼分
 
-1. **跌倒偵測已在 Pi**（`12_Fall_Detection`）；同一大腦才能做「確認跌倒 → `X` 急停」。
-2. UNO／BMP73T104 命令介面已穩定；少改韌體風險最低。
-3. AOA 官方輸出面向 host（PC／Pi），Qt demo 同路徑；到貨後用 Pi 解析最快落地。
-4. 之後壁障（5× VL53L0X）也適合在 Pi 融合後再下命令。
+| 角色 | 做什麼 | 不做什麼 |
+|------|--------|----------|
+| AOA Anchor | 算出 Tag **距離／角度**並上報 | 不必改韌體直接控馬達（第一版） |
+| 樹莓派 5 | **跌倒偵測**；讀 AOA、下馬達命令；可選相機輔助跟隨 | 不以 YOLO 當跟隨主方位 |
+| UNO + BMP | 聽 `F/L/R/Z/S/X` 開車 | 不算 AOA |
 
-### 不建議的替代
+### 為什麼跟隨決策仍建議經過 Pi（第一版）
+
+1. 跌倒已在 Pi；同一台最容易做「跌倒確認 → 急停」。
+2. AOA 官方本來就是報給 host（PC／Pi）；Pi 解析最快落地。
+3. UNO 命令介面已穩，少改韌體。
+
+之後若證明 AOA→UNO 直連更單純、且跌倒急停另有通路，再評估精簡亦可。
+
+### 不建議
 
 | 方案 | 問題 |
 |------|------|
-| Anchor 韌體直接算 F/L/R 打 UNO | 需改 STM32 韌體＋失去與跌倒／相機融合 |
-| 繼續用 ESP32-UWB 當距離源 | 與本目標衝突，應卸除 |
-| 保留 ESP32 只做 USB→Serial2 轉發 | 可當過渡，但多一顆板；最終應改 USB-TTL |
+| 繼續用 ESP32-UWB 當距離源 | 已決定改 AOA |
+| 用 YOLO 當跟隨主方案、AOA 當配角 | 與目標相反 |
+| 第一版就大改 Anchor 韌體直控馬達 | 拖慢「兩功能先跑起來」 |
 
 ---
 
@@ -146,61 +157,57 @@ JSxxxx{"TWR": {"a16":"...","R":n,"T":...,"D":343,"P":...,"Xcm":...,"Ycm":...,"O"
 
 ## 5. 與現有程式如何銜接
 
-### PixelBit：`13_Vision_UWB_Follow/follow_car.py`
+### 跌倒（主責，已大致完成）
 
-保留檔案，演進為 **模式切換**（建議）：
+- `12_Fall_Detection/`：維持獨立服務（port 5000）即可。  
+- 後續小加分：確認跌倒時對馬達口送 `X`／`S`（與跟隨共用 `MOTOR_SERIAL_PORT`）。
+
+### 跟隨：`13_Vision_UWB_Follow/follow_car.py` → 演進／或新腳本在本目錄
 
 ```text
-FOLLOW_SOURCE=aoa | vision | fused
+FOLLOW_SOURCE=aoa          # 目標預設：只靠 AOA 距離+角度
+# FOLLOW_SOURCE=vision     # 套件未到前的過渡
+# FOLLOW_SOURCE=fused      # 可選：AOA 為主，相機只在能提高精度／補 ±60° 外時用
 ```
-
-| 模式 | 方位 | 距離 | 用途 |
-|------|------|------|------|
-| `vision` | YOLO offset | （可選）無／手動 | 套件未到／室內光好 |
-| `aoa` | AOA angle | AOA dist | **主目標** |
-| `fused` | AOA 優先；AOA 失效才 YOLO | AOA | 室外／遮擋備援 |
 
 實作要點：
 
-1. 新增 `AoaReader`（解析 Mode B 或 JSON），取代只認 `D:1.85` 的 `SerialReader`。
-2. `decide_command()` 改吃 `angle_deg`／`has_fix`，視覺路徑改呼叫同一決策。
-3. **馬達出口與 AOA 口分離**：`MOTOR_SERIAL_PORT` ≠ `AOA_SERIAL_PORT`（不再假設「同一 USB 轉發」）。
-4. 控制迴圈維持背景 thread（不依賴瀏覽器 `video_feed`）。
+1. 新增 `AoaReader`（Mode B 或 JSON），取代只認 `D:1.85`。  
+2. `decide_command()` 以 **angle_deg + distance_m** 為主。  
+3. **馬達口與 AOA 口分離**。  
+4. 控制迴圈背景 thread；不依賴瀏覽器。
 
 ### `uwb-follow-car`
 
 | 資料夾 | 處置 |
 |--------|------|
 | `uno_car/` | **保留**，幾乎不改 |
-| `uwb_car_responder/`、`uwb_tag_initiator/` | 標記 deprecated；不再燒錄 |
-| （可選）新 `serial_relay/` | 若暫時沒 USB-TTL，可用閒置 ESP32 **只轉發**字元 |
-
-本機舊路徑 `C:\Users\a0907\Documents\uwb-follow-car` 以 GitHub `cursor/pi-vision-follow-1509` 為準；AOA 落地後再開 `cursor/aoa-follow-…` 分支清掉 UWB 角色說明。
+| `uwb_car_responder/`、`uwb_tag_initiator/` | deprecated |
+| （可選）`serial_relay/` | 暫無 USB-TTL 時用閒置 ESP32 只轉發 |
 
 ---
 
-## 6. 過渡相機方案：要不要保留？
+## 6. 相機在跟隨裡的角色
 
-**要保留。** 理由：
+| 用途 | 要不要 |
+|------|--------|
+| **跌倒偵測** | **要**（Pi 主責，必留相機） |
+| 跟隨主方位 | **不要**；改 AOA |
+| 套件未到前過渡跟隨 | 可暫留 `vision` |
+| 讓跟隨更準／補 AOA 視角外 | **可選** `fused`；有實測增益再留，不是必做 |
 
-1. 套件未到前仍可實車驗證馬達／UNO／過流行為。  
-2. AOA 只有 ±60°；人跑出視角時相機或 `Z` 搜尋仍有價值。  
-3. 跌倒偵測本來就靠相機；跟隨視覺模組可共用相機管線（注意 CPU：跟隨與跌倒建議分時或分 process）。  
-4. 刪除成本高、保留成本低（`FOLLOW_SOURCE=vision` 即可）。
-
-建議：AOA 穩定後預設 `aoa`，`vision`／`fused` 當開關，不刪目錄。
+AOA 穩定後預設 `aoa`。壁障（5× VL53L0X）仍列之後，不在當前兩大功能內。
 
 ---
 
-## 7. 到貨後實作順序
+## 7. 實作順序（對準兩大功能）
 
-1. Qt 驗證 Anchor↔Tag（距離／角度跳動是否合理）。  
-2. Pi 辨識埠：`ls /dev/ttyACM* /dev/ttyUSB*`；寫死到 `.env`。  
-3. 切 Mode B，跑 `aoa_sniff.py`（見同目錄）確認 angle／cm。  
-4. 接 USB-TTL → UNO，只用鍵盤／腳本送 `F/L/R/S` 確認馬達。  
-5. 接上 `decide_command` AOA 路徑，先關相機。  
-6. 再打開 `fused`／與跌倒急停聯動。  
-7. 最後規劃 5× VL53L0X 壁障（未做）。
+1. **跌倒**：維持現況可演示（必要時再接急停）。  
+2. AOA 到貨：Qt 驗證距離／角度。  
+3. Pi：`aoa_sniff.py` 校對 → USB-TTL 驗馬達 → AOA `decide` 實車跟隨。  
+4. （可選）跌倒確認 → 小車急停。  
+5. （可選）`fused` 若實測更穩再加。  
+6. 之後才做 VL53L0X 壁障。
 
 ---
 
