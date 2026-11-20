@@ -46,5 +46,7 @@ IMGBB_API_KEY=...
 ```bash
 LITTERBOX_KEEP=1h
 ROLLING_BUFFER_SECONDS=30
+FALL_SENSITIVITY=1.45
+# 蹲下仍抓不到可改 1.6 或 1.8；桌前又誤報可降到 1.2
 # PUBLIC_BASE_URL=https://xxxx.trycloudflare.com
 ```

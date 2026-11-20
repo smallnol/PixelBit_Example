@@ -58,6 +58,12 @@ FALL_CONFIRM_SECONDS = 10.0
 ALERT_COOLDOWN_SECONDS = 30.0
 # 行車紀錄器式：持續保留最近 N 秒；沒跌倒就隨時間自動覆蓋刪除
 ROLLING_BUFFER_SECONDS = float(os.getenv('ROLLING_BUFFER_SECONDS', '30'))
+# 跌倒靈敏度：1.0=偏嚴（幾乎要躺平），預設 1.45 可抓蹲下／半倒；越大越敏感
+try:
+  FALL_SENSITIVITY = float(os.getenv('FALL_SENSITIVITY', '1.45'))
+except ValueError:
+  FALL_SENSITIVITY = 1.45
+FALL_SENSITIVITY = max(0.8, min(FALL_SENSITIVITY, 2.5))
 CLIP_FPS = 10.0
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
@@ -92,6 +98,10 @@ print(
 print(
     f'☁️ 影片上傳優先 litterbox（{LITTERBOX_KEEP}）；'
     '若掛掉則改 uguu/pomf（約數小時自動刪）'
+)
+print(
+    f'🎯 跌倒靈敏度 FALL_SENSITIVITY={FALL_SENSITIVITY:g} '
+    '（越大越敏感；蹲下也較容易觸發，桌前坐姿仍會排除）'
 )
 
 
@@ -779,8 +789,9 @@ def analyze_pose(result) -> tuple[bool, bool, bool, float, float, float] | None:
   """
   回傳 (is_fall, lateral, frontal, aspect_ratio, torso_height, avg_shoulder_y)。
 
-  舊邏輯「寬高比 > 1.1 就算側摔」會把「側坐、手伸向筆電」誤判成跌倒。
-  現在要求：框夠扁 + 肩髖接近水平（軀幹幾乎躺平），且排除明顯坐姿。
+  目標：
+  - 桌前坐姿／低頭打字 → 不報
+  - 蹲下、半倒、躺平 → 依 FALL_SENSITIVITY 可報（預設偏敏感）
   """
   if len(result.boxes) == 0 or result.keypoints is None or len(result.keypoints.data) == 0:
     return None
@@ -791,11 +802,10 @@ def analyze_pose(result) -> tuple[bool, bool, bool, float, float, float] | None:
   if h <= 1e-6:
     return None
   aspect_ratio = round(w / h, 2)
-  box_top = cy - h / 2
-  box_bottom = cy + h / 2
+  sens = FALL_SENSITIVITY
 
   keypoints = result.keypoints.data[0]
-  # COCO: 0鼻 5/6肩 7/8肘 9/10腕 11/12髖 13/14膝 15/16踝
+  # COCO: 0鼻 5/6肩 9/10腕 11/12髖 13/14膝
   nose = _kp_xy(keypoints, 0)
   l_sh = _kp_xy(keypoints, 5)
   r_sh = _kp_xy(keypoints, 6)
@@ -811,61 +821,58 @@ def analyze_pose(result) -> tuple[bool, bool, bool, float, float, float] | None:
   wrist = _avg_point(l_wr, r_wr)
   knee = _avg_point(l_knee, r_knee)
 
-  # 關鍵點不可靠時：不要單靠寬高比亂報跌倒（坐姿側拍最容易誤觸）
+  # 關鍵點不可靠：寬扁 + 人在畫面偏下才當側摔（避免桌前側坐）
   if shoulder is None or hip is None:
-    return (False, False, False, aspect_ratio, -1.0, -1.0)
+    box_low = cy > (FRAME_HEIGHT * (0.58 - 0.08 * (sens - 1.0)))
+    is_fall_lateral = aspect_ratio > (1.30 - 0.12 * (sens - 1.0)) and box_low
+    return (is_fall_lateral, is_fall_lateral, False, aspect_ratio, -1.0, -1.0)
 
   avg_shoulder_y = shoulder[1]
   avg_hip_y = hip[1]
   torso_height = abs(avg_hip_y - avg_shoulder_y)
-  # 頭到髖的垂直跨距：坐／站通常明顯 > 0；躺平接近 0
   head_y = nose[1] if nose else avg_shoulder_y
   head_to_hip = abs(avg_hip_y - head_y)
-  head_from_top = head_y - box_top
 
-  # --- 坐姿排除（桌前低頭最常見）---
-  # 1) 頭還在框的上半 → 多半坐／站，不是整個人躺在地上
-  head_near_top = head_from_top < (0.42 * h)
-  # 2) 肩到髖仍有明顯垂直高度（側坐時軀幹是斜的，但不會接近水平）
-  torso_still_upright = torso_height > max(55.0, 0.28 * h)
-  # 3) 頭明顯高於髖
-  head_above_hips = (avg_hip_y - head_y) > max(70.0, 0.32 * h)
-  # 4) 手腕大約在桌面高度、且頭仍高於手腕 → 典型「坐著操作」
+  # --- 桌前坐姿排除（只擋「操作桌面」，不擋蹲下）---
   desk_pose = False
   if wrist is not None:
-    wrist_near_hip = abs(wrist[1] - avg_hip_y) < max(70.0, 0.35 * h)
-    head_above_wrist = (wrist[1] - head_y) > max(40.0, 0.18 * h)
-    desk_pose = wrist_near_hip and head_above_wrist
-  # 5) 膝蓋不可見（被桌子擋）+ 頭在上方 → 更像坐在桌後，不是倒地
-  lower_occluded = knee is None and head_near_top
+    wrist_near_hip = abs(wrist[1] - avg_hip_y) < max(80.0, 0.40 * h)
+    head_above_wrist = (wrist[1] - head_y) > max(35.0, 0.15 * h)
+    # 肩膀仍偏畫面上方＝坐著，不是蹲在地上
+    shoulders_mid_high = avg_shoulder_y < (FRAME_HEIGHT * 0.42)
+    desk_pose = wrist_near_hip and head_above_wrist and shoulders_mid_high
 
-  looks_like_sitting = (
-      head_near_top
-      and (torso_still_upright or head_above_hips or desk_pose or lower_occluded)
+  if desk_pose:
+    return (False, False, False, aspect_ratio, torso_height, avg_shoulder_y)
+
+  # --- 跌倒／蹲下條件（數值隨 FALL_SENSITIVITY 放寬）---
+  # 軀幹「夠扁」門檻：敏感度越高，允許越大的 torso_height 仍算倒地
+  torso_limit = max(70.0, 0.36 * h) * sens
+  head_hip_limit = max(95.0, 0.48 * h) * sens
+  shoulder_low_y = FRAME_HEIGHT * (0.40 - 0.06 * (sens - 1.0))
+  aspect_lateral = 1.28 - 0.15 * (sens - 1.0)
+
+  torso_compressed = torso_height < torso_limit
+  head_compressed = head_to_hip < head_hip_limit
+  body_low = avg_shoulder_y > shoulder_low_y
+
+  knees_tucked = False
+  if knee is not None:
+    knees_tucked = abs(knee[1] - avg_hip_y) < (max(55.0, 0.32 * h) * sens)
+
+  # 側摔：框偏扁 + 人偏低 + 軀幹有壓縮
+  is_fall_lateral = (
+      aspect_ratio > aspect_lateral and body_low and torso_compressed
   )
-  if looks_like_sitting:
-    return (
-        False,
-        False,
-        False,
-        aspect_ratio,
-        torso_height,
-        avg_shoulder_y,
-    )
-
-  # --- 跌倒條件（需同時滿足「框扁」+「軀幹躺平」）---
-  torso_flat = torso_height < max(40.0, 0.22 * h)
-  head_hip_flat = head_to_hip < max(55.0, 0.30 * h)
-  # 倒地時人通常偏畫面下方；純坐姿頭多半偏上
-  body_low = box_bottom > (FRAME_HEIGHT * 0.72) or avg_shoulder_y > (FRAME_HEIGHT * 0.45)
-
-  is_fall_lateral = (aspect_ratio > 1.35) and torso_flat and head_hip_flat and body_low
+  # 正面倒／半倒：人偏低 + 頭髖距離壓縮
   is_fall_frontal = (
-      torso_flat
-      and head_hip_flat
-      and (avg_shoulder_y > FRAME_HEIGHT * 0.48)
-      and aspect_ratio < 1.6
+      body_low and head_compressed and torso_compressed and aspect_ratio < 1.85
   )
+  # 蹲下：膝蓋靠近髖 + 肩膀偏低（不算桌前坐姿）
+  is_fall_crouch = body_low and knees_tucked and head_compressed
+  if is_fall_crouch:
+    is_fall_frontal = True
+
   is_currently_falling = is_fall_lateral or is_fall_frontal
   return (
       is_currently_falling,
