@@ -515,7 +515,7 @@ def send_fall_alert(
     preview_path: Path,
     video_path: Path | None = None,
 ) -> None:
-  """推播文字 + ImgBB 照片 + cloudflared 影片氣泡（可點開播放）。"""
+  """推播文字 + ImgBB 照片 + litterbox/catbox 影片氣泡（可點開播放）。"""
   messages: list[dict] = [{'type': 'text', 'text': message_text}]
 
   original_url, preview_url = resolve_image_urls(original_path, preview_path)
