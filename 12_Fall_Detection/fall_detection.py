@@ -758,44 +758,114 @@ def finalize_confirmed_event(event: dict, annotated_frame: np.ndarray) -> tuple[
   return confirmed_original, confirmed_preview, confirmed_video
 
 
+def _kp_xy(keypoints, idx: int, min_conf: float = 0.25) -> tuple[float, float] | None:
+  """讀取 COCO keypoint；信心不足則回 None。"""
+  x, y, c = float(keypoints[idx][0]), float(keypoints[idx][1]), float(keypoints[idx][2])
+  if c < min_conf:
+    return None
+  return x, y
+
+
+def _avg_point(
+    a: tuple[float, float] | None,
+    b: tuple[float, float] | None,
+) -> tuple[float, float] | None:
+  if a and b:
+    return ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+  return a or b
+
+
 def analyze_pose(result) -> tuple[bool, bool, bool, float, float, float] | None:
-  """回傳 (is_fall, lateral, frontal, aspect_ratio, torso_height, avg_shoulder_y)。"""
+  """
+  回傳 (is_fall, lateral, frontal, aspect_ratio, torso_height, avg_shoulder_y)。
+
+  舊邏輯「寬高比 > 1.1 就算側摔」會把「側坐、手伸向筆電」誤判成跌倒。
+  現在要求：框夠扁 + 肩髖接近水平（軀幹幾乎躺平），且排除明顯坐姿。
+  """
   if len(result.boxes) == 0 or result.keypoints is None or len(result.keypoints.data) == 0:
     return None
 
   box = result.boxes.xywh[0]
+  cx, cy = float(box[0]), float(box[1])
   w, h = float(box[2]), float(box[3])
   if h <= 1e-6:
     return None
   aspect_ratio = round(w / h, 2)
+  box_top = cy - h / 2
+  box_bottom = cy + h / 2
 
   keypoints = result.keypoints.data[0]
-  # COCO: 5/6 肩膀, 11/12 髖
-  confs = [float(keypoints[i][2]) for i in (5, 6, 11, 12)]
-  if min(confs) < 0.3:
-    # 關鍵點太不可靠時，僅用寬高比做側向判斷
-    is_fall_lateral = aspect_ratio > 1.1
-    is_fall_frontal = False
+  # COCO: 0鼻 5/6肩 7/8肘 9/10腕 11/12髖 13/14膝 15/16踝
+  nose = _kp_xy(keypoints, 0)
+  l_sh = _kp_xy(keypoints, 5)
+  r_sh = _kp_xy(keypoints, 6)
+  l_hip = _kp_xy(keypoints, 11)
+  r_hip = _kp_xy(keypoints, 12)
+  l_wr = _kp_xy(keypoints, 9)
+  r_wr = _kp_xy(keypoints, 10)
+  l_knee = _kp_xy(keypoints, 13)
+  r_knee = _kp_xy(keypoints, 14)
+
+  shoulder = _avg_point(l_sh, r_sh)
+  hip = _avg_point(l_hip, r_hip)
+  wrist = _avg_point(l_wr, r_wr)
+  knee = _avg_point(l_knee, r_knee)
+
+  # 關鍵點不可靠時：不要單靠寬高比亂報跌倒（坐姿側拍最容易誤觸）
+  if shoulder is None or hip is None:
+    return (False, False, False, aspect_ratio, -1.0, -1.0)
+
+  avg_shoulder_y = shoulder[1]
+  avg_hip_y = hip[1]
+  torso_height = abs(avg_hip_y - avg_shoulder_y)
+  # 頭到髖的垂直跨距：坐／站通常明顯 > 0；躺平接近 0
+  head_y = nose[1] if nose else avg_shoulder_y
+  head_to_hip = abs(avg_hip_y - head_y)
+  head_from_top = head_y - box_top
+
+  # --- 坐姿排除（桌前低頭最常見）---
+  # 1) 頭還在框的上半 → 多半坐／站，不是整個人躺在地上
+  head_near_top = head_from_top < (0.42 * h)
+  # 2) 肩到髖仍有明顯垂直高度（側坐時軀幹是斜的，但不會接近水平）
+  torso_still_upright = torso_height > max(55.0, 0.28 * h)
+  # 3) 頭明顯高於髖
+  head_above_hips = (avg_hip_y - head_y) > max(70.0, 0.32 * h)
+  # 4) 手腕大約在桌面高度、且頭仍高於手腕 → 典型「坐著操作」
+  desk_pose = False
+  if wrist is not None:
+    wrist_near_hip = abs(wrist[1] - avg_hip_y) < max(70.0, 0.35 * h)
+    head_above_wrist = (wrist[1] - head_y) > max(40.0, 0.18 * h)
+    desk_pose = wrist_near_hip and head_above_wrist
+  # 5) 膝蓋不可見（被桌子擋）+ 頭在上方 → 更像坐在桌後，不是倒地
+  lower_occluded = knee is None and head_near_top
+
+  looks_like_sitting = (
+      head_near_top
+      and (torso_still_upright or head_above_hips or desk_pose or lower_occluded)
+  )
+  if looks_like_sitting:
     return (
-        is_fall_lateral or is_fall_frontal,
-        is_fall_lateral,
-        is_fall_frontal,
+        False,
+        False,
+        False,
         aspect_ratio,
-        -1.0,
-        -1.0,
+        torso_height,
+        avg_shoulder_y,
     )
 
-  l_shoulder_y = float(keypoints[5][1])
-  r_shoulder_y = float(keypoints[6][1])
-  l_hip_y = float(keypoints[11][1])
-  r_hip_y = float(keypoints[12][1])
+  # --- 跌倒條件（需同時滿足「框扁」+「軀幹躺平」）---
+  torso_flat = torso_height < max(40.0, 0.22 * h)
+  head_hip_flat = head_to_hip < max(55.0, 0.30 * h)
+  # 倒地時人通常偏畫面下方；純坐姿頭多半偏上
+  body_low = box_bottom > (FRAME_HEIGHT * 0.72) or avg_shoulder_y > (FRAME_HEIGHT * 0.45)
 
-  avg_shoulder_y = (l_shoulder_y + r_shoulder_y) / 2
-  avg_hip_y = (l_hip_y + r_hip_y) / 2
-  torso_height = abs(avg_hip_y - avg_shoulder_y)
-
-  is_fall_lateral = aspect_ratio > 1.1
-  is_fall_frontal = (torso_height < 40) and (avg_shoulder_y > 220)
+  is_fall_lateral = (aspect_ratio > 1.35) and torso_flat and head_hip_flat and body_low
+  is_fall_frontal = (
+      torso_flat
+      and head_hip_flat
+      and (avg_shoulder_y > FRAME_HEIGHT * 0.48)
+      and aspect_ratio < 1.6
+  )
   is_currently_falling = is_fall_lateral or is_fall_frontal
   return (
       is_currently_falling,
