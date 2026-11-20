@@ -465,7 +465,7 @@ def resolve_video_url(video_path: Path, preview_url: str | None) -> tuple[Path |
 
   video_url = upload_video_for_line(ready)
   if not video_url:
-    print('⚠️ catbox/litterbox/cloudflared 都無法提供影片網址')
+    print('⚠️ litterbox/catbox 都無法提供影片網址')
     return ready, None, preview_url
   print(f'🎬 影片網址: {video_url}')
 
