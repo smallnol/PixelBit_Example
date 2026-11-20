@@ -232,21 +232,37 @@ def upload_to_telegraph(image_path: Path) -> str | None:
   return None
 
 
-def _upload_headers() -> dict:
-  return {
-      'User-Agent': 'Mozilla/5.0 (X11; Linux aarch64) FallDetection/1.0',
-  }
+def _browser_ua() -> str:
+  return (
+      'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  )
+
+
+def line_can_embed_video(url: str | None) -> bool:
+  """LINE 影片氣泡目前較穩的直連主機。"""
+  if not url:
+    return False
+  u = url.lower()
+  return ('litter.catbox.moe/' in u) or ('files.catbox.moe/' in u)
 
 
 def upload_to_catbox(file_path: Path) -> str | None:
-  """上傳影片到 catbox（最早「點氣泡可播」常用的直連方式）。"""
+  """
+  litterbox 掛掉時的主力備援（LINE 可播）。
+  412 Invalid uploader 常見原因：UA/Referer/檔案 MIME 不對。
+  """
+  headers = {
+      'User-Agent': _browser_ua(),
+      'Referer': 'https://catbox.moe/',
+  }
   try:
     with open(file_path, 'rb') as f:
       res = requests.post(
           'https://catbox.moe/user/api.php',
           data={'reqtype': 'fileupload'},
-          files={'fileToUpload': (file_path.name, f, 'video/mp4')},
-          headers=_upload_headers(),
+          files={'fileToUpload': (file_path.name, f, 'application/octet-stream')},
+          headers=headers,
           timeout=180,
       )
     text = (res.text or '').strip()
@@ -257,45 +273,77 @@ def upload_to_catbox(file_path: Path) -> str | None:
     print(f'❌ catbox 上傳失敗: {res.status_code} {text[:300]!r}')
   except Exception as e:
     print(f'❌ catbox 上傳例外: {e}')
+
+  # curl 備援（部分樹莓派環境 requests 會被擋）
+  try:
+    import subprocess
+
+    result = subprocess.run(
+        [
+            'curl', '-sS',
+            '-A', _browser_ua(),
+            '-e', 'https://catbox.moe/',
+            '-F', 'reqtype=fileupload',
+            '-F', f'fileToUpload=@{file_path};filename={file_path.name};type=application/octet-stream',
+            'https://catbox.moe/user/api.php',
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    text = (result.stdout or '').strip()
+    if result.returncode == 0 and text.startswith('https://'):
+      print(f'☁️ catbox(curl) 上傳成功: {text}')
+      return text
+    print(f'❌ catbox(curl) 失敗: {text[:300]!r}')
+  except Exception as e:
+    print(f'❌ catbox(curl) 例外: {e}')
   return None
 
 
 def upload_to_litterbox(file_path: Path, keep: str | None = None) -> str | None:
-  """catbox 姊妹站，檔案會自動過期（僅 1h/12h/24h/72h）。"""
+  """影片理想主力（會過期）；目前常 500，失敗就改走 catbox。"""
   keep = keep or LITTERBOX_KEEP
-  try:
-    with open(file_path, 'rb') as f:
-      res = requests.post(
-          'https://litterbox.catbox.moe/resources/internals/api.php',
-          data={'reqtype': 'fileupload', 'time': keep},
-          files={'fileToUpload': (file_path.name, f, 'video/mp4')},
-          headers=_upload_headers(),
-          timeout=180,
-      )
-    text = (res.text or '').strip()
-    print(f'☁️ litterbox 回應: status={res.status_code} body={text[:200]!r}')
-    if res.status_code == 200 and text.startswith('https://'):
-      print(f'☁️ litterbox 上傳成功（{keep} 後刪）: {text}')
-      return text
-    print(f'❌ litterbox 上傳失敗: {res.status_code} {text[:300]!r}')
-  except Exception as e:
-    print(f'❌ litterbox 上傳例外: {e}')
+  headers = {
+      'User-Agent': _browser_ua(),
+      'Referer': 'https://litterbox.catbox.moe/',
+  }
+  for attempt in range(1, 3):
+    try:
+      with open(file_path, 'rb') as f:
+        res = requests.post(
+            'https://litterbox.catbox.moe/resources/internals/api.php',
+            data={'reqtype': 'fileupload', 'time': keep},
+            files={'fileToUpload': (file_path.name, f, 'application/octet-stream')},
+            headers=headers,
+            timeout=180,
+        )
+      text = (res.text or '').strip()
+      print(f'☁️ litterbox 回應: status={res.status_code} body={text[:200]!r}')
+      if res.status_code == 200 and text.startswith('https://'):
+        print(f'☁️ litterbox 上傳成功（{keep} 後刪）: {text}')
+        return text
+      print(f'❌ litterbox 上傳失敗 (第 {attempt}/2): {res.status_code}')
+      if res.status_code == 500 and attempt == 1:
+        time.sleep(1.5)
+        continue
+    except Exception as e:
+      print(f'❌ litterbox 上傳例外: {e}')
   return None
 
 
 def upload_video_for_line(video_path: Path) -> str | None:
   """
-  影片優先 litterbox（你目前可播且會自動刪），其次 catbox，最後 cloudflared。
+  目前 litterbox 常 500，因此：
+  1) 先試 litterbox（恢復後仍可用、會自動刪）
+  2) 再試 catbox（LINE 可播）
+  不使用 tmpfiles／失效 cloudflared 當 LINE video（會錯誤不明）
   """
   for uploader in (upload_to_litterbox, upload_to_catbox):
     url = uploader(video_path)
-    if url and url.startswith('https://'):
+    if url and line_can_embed_video(url):
       return url
-
-  tunnel = public_media_url(video_path)
-  if tunnel:
-    print(f'🔗 圖床失敗，改用 cloudflared 備援: {tunnel}')
-    return tunnel
+  print('⚠️ litterbox/catbox 都無法提供 LINE 可播網址（litterbox 可能仍維修中）')
   return None
 
 
@@ -492,7 +540,12 @@ def send_fall_alert(
 
   if video_path and video_path.exists():
     _ready, video_url, video_preview = resolve_video_url(video_path, preview_url)
-    if video_url and video_preview:
+    if (
+        video_url
+        and video_preview
+        and line_can_embed_video(video_url)
+        and line_can_embed_image(video_preview)
+    ):
       messages.append(
           {
               'type': 'video',
@@ -504,9 +557,9 @@ def send_fall_alert(
       print(f'🎬 將以 LINE 影片氣泡發送: {video_url}')
     else:
       print(
-          '⚠️ 無法建立 LINE 影片氣泡。請確認：'
-          '1) cloudflared 有在跑  2) .env 的 PUBLIC_BASE_URL 是最新 https 網址  '
-          '3) 程式已重開讀到新網址'
+          '⚠️ 無法建立可播放的 LINE 影片氣泡。'
+          'litterbox 目前常 500；若 catbox 也失敗請稍後重試。'
+          '照片仍會正常發送。'
       )
 
   if len(messages) > 1:
