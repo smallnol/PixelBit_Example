@@ -5,7 +5,7 @@
 1. 預設僅骨架預覽（不警報）
 2. 鏡頭持續保留最近約 30 秒畫面（行車紀錄器式循環緩衝；逾時自動丟掉）
 3. 開啟偵測後，若姿勢異常 → 用「跌倒前 30 秒 + 倒地過程」開始組影片
-4. 持續異常滿 FALL_CONFIRM_SECONDS → 確認跌倒：推播 LINE（ImgBB 照片 + litterbox/catbox 影片）
+4. 持續異常滿 FALL_CONFIRM_SECONDS → 確認跌倒：推播 LINE（ImgBB 照片 + 短效影片圖床）
 5. 若在確認前站起來 → 自動刪除疑似短片與暫存照片
 """
 
@@ -90,8 +90,8 @@ print(
     f'（最多 {rolling_maxlen} 幀 @ {CLIP_FPS:g} fps；無跌倒會自動覆蓋）'
 )
 print(
-    f'☁️ 影片上傳 litterbox 保存 {LITTERBOX_KEEP}'
-    '（此服務最短 1 小時，無法設 10 分鐘）'
+    f'☁️ 影片上傳優先 litterbox（{LITTERBOX_KEEP}）；'
+    '若掛掉則改 uguu/pomf（約數小時自動刪）'
 )
 
 
@@ -169,6 +169,8 @@ def is_direct_https_media_url(url: str) -> bool:
           'ibb.co/',
           'files.catbox.moe/',
           'litter.catbox.moe/',
+          'uguu.se/',
+          'pomf2.lain.la/',
           '0x0.st/',
       )
   ):
@@ -240,27 +242,46 @@ def _browser_ua() -> str:
 
 
 def line_can_embed_video(url: str | None) -> bool:
-  """LINE 影片氣泡目前較穩的直連主機。"""
+  """LINE 影片氣泡可用的直連 HTTPS mp4 主機。"""
   if not url:
     return False
   u = url.lower()
-  return ('litter.catbox.moe/' in u) or ('files.catbox.moe/' in u)
+  if not u.startswith('https://'):
+    return False
+  hosts = (
+      'litter.catbox.moe/',
+      'files.catbox.moe/',
+      'uguu.se/',
+      'pomf2.lain.la/',
+      'lain.la/',
+      'trycloudflare.com/',
+  )
+  if any(h in u for h in hosts):
+    return True
+  # 自架 cloudflared / PUBLIC_BASE_URL：路徑需是 .mp4
+  if PUBLIC_BASE_URL and u.startswith(PUBLIC_BASE_URL.lower()) and u.endswith('.mp4'):
+    return True
+  return False
 
 
 def upload_to_catbox(file_path: Path) -> str | None:
   """
-  litterbox 掛掉時的主力備援（LINE 可播）。
-  412 Invalid uploader 常見原因：UA/Referer/檔案 MIME 不對。
+  litterbox 姊妹站。目前常回 412 Invalid uploader（對方擋 IP／VPN／機房網段），
+  不是本機參數能修好的；失敗就改走 uguu/pomf。
   """
   headers = {
       'User-Agent': _browser_ua(),
       'Referer': 'https://catbox.moe/',
   }
+  data = {'reqtype': 'fileupload'}
+  userhash = os.getenv('CATBOX_USERHASH', '').strip()
+  if userhash:
+    data['userhash'] = userhash
   try:
     with open(file_path, 'rb') as f:
       res = requests.post(
           'https://catbox.moe/user/api.php',
-          data={'reqtype': 'fileupload'},
+          data=data,
           files={'fileToUpload': (file_path.name, f, 'application/octet-stream')},
           headers=headers,
           timeout=180,
@@ -270,39 +291,17 @@ def upload_to_catbox(file_path: Path) -> str | None:
     if res.status_code == 200 and text.startswith('https://'):
       print(f'☁️ catbox 上傳成功: {text}')
       return text
-    print(f'❌ catbox 上傳失敗: {res.status_code} {text[:300]!r}')
+    if res.status_code == 412 or 'invalid uploader' in text.lower():
+      print('⚠️ catbox 拒絕上傳（Invalid uploader＝對方擋來源 IP，非程式錯誤）')
+    else:
+      print(f'❌ catbox 上傳失敗: {res.status_code} {text[:300]!r}')
   except Exception as e:
     print(f'❌ catbox 上傳例外: {e}')
-
-  # curl 備援（部分樹莓派環境 requests 會被擋）
-  try:
-    import subprocess
-
-    result = subprocess.run(
-        [
-            'curl', '-sS',
-            '-A', _browser_ua(),
-            '-e', 'https://catbox.moe/',
-            '-F', 'reqtype=fileupload',
-            '-F', f'fileToUpload=@{file_path};filename={file_path.name};type=application/octet-stream',
-            'https://catbox.moe/user/api.php',
-        ],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    text = (result.stdout or '').strip()
-    if result.returncode == 0 and text.startswith('https://'):
-      print(f'☁️ catbox(curl) 上傳成功: {text}')
-      return text
-    print(f'❌ catbox(curl) 失敗: {text[:300]!r}')
-  except Exception as e:
-    print(f'❌ catbox(curl) 例外: {e}')
   return None
 
 
 def upload_to_litterbox(file_path: Path, keep: str | None = None) -> str | None:
-  """影片理想主力（會過期）；目前常 500，失敗就改走 catbox。"""
+  """影片理想主力（會過期）；目前常 500，失敗就改走其他圖床。"""
   keep = keep or LITTERBOX_KEEP
   headers = {
       'User-Agent': _browser_ua(),
@@ -332,18 +331,85 @@ def upload_to_litterbox(file_path: Path, keep: str | None = None) -> str | None:
   return None
 
 
+def upload_to_uguu(file_path: Path) -> str | None:
+  """uguu.se：直連 video/mp4，檔案約數小時後自動刪（適合短效通報）。"""
+  headers = {'User-Agent': _browser_ua()}
+  try:
+    with open(file_path, 'rb') as f:
+      res = requests.post(
+          'https://uguu.se/upload',
+          files={'files[]': (file_path.name, f, 'video/mp4')},
+          headers=headers,
+          timeout=180,
+      )
+    data = res.json()
+    if res.status_code == 200 and data.get('success'):
+      files = data.get('files') or []
+      if files and isinstance(files[0], dict):
+        url = (files[0].get('url') or '').strip()
+        if url.startswith('https://'):
+          print(f'☁️ uguu 上傳成功（短效自動刪）: {url}')
+          return url
+    print(f'❌ uguu 上傳失敗: {res.status_code} {str(data)[:300]!r}')
+  except Exception as e:
+    print(f'❌ uguu 上傳例外: {e}')
+  return None
+
+
+def upload_to_pomf(file_path: Path) -> str | None:
+  """pomf.lain.la：直連 video/mp4 備援。"""
+  headers = {'User-Agent': _browser_ua()}
+  try:
+    with open(file_path, 'rb') as f:
+      res = requests.post(
+          'https://pomf.lain.la/upload.php',
+          files={'files[]': (file_path.name, f, 'video/mp4')},
+          headers=headers,
+          timeout=180,
+      )
+    data = res.json()
+    if res.status_code == 200 and data.get('success'):
+      files = data.get('files') or []
+      if files and isinstance(files[0], dict):
+        url = (files[0].get('url') or '').strip()
+        if url.startswith('https://'):
+          print(f'☁️ pomf 上傳成功: {url}')
+          return url
+    print(f'❌ pomf 上傳失敗: {res.status_code} {str(data)[:300]!r}')
+  except Exception as e:
+    print(f'❌ pomf 上傳例外: {e}')
+  return None
+
+
 def upload_video_for_line(video_path: Path) -> str | None:
   """
-  目前 litterbox 常 500，因此：
-  1) 先試 litterbox（恢復後仍可用、會自動刪）
-  2) 再試 catbox（LINE 可播）
-  不使用 tmpfiles／失效 cloudflared 當 LINE video（會錯誤不明）
+  影片上傳順序：
+  1) litterbox（會過期；目前常 500）
+  2) catbox（目前常 412 Invalid uploader＝對方擋 IP）
+  3) uguu（短效自動刪，直連 mp4）
+  4) pomf（直連 mp4 備援）
+  5) cloudflared PUBLIC_BASE_URL（需隧道網址新鮮）
   """
-  for uploader in (upload_to_litterbox, upload_to_catbox):
+  for uploader in (
+      upload_to_litterbox,
+      upload_to_catbox,
+      upload_to_uguu,
+      upload_to_pomf,
+  ):
     url = uploader(video_path)
     if url and line_can_embed_video(url):
       return url
-  print('⚠️ litterbox/catbox 都無法提供 LINE 可播網址（litterbox 可能仍維修中）')
+
+  tunnel = public_media_url(video_path)
+  if tunnel and line_can_embed_video(tunnel):
+    print(f'🔗 圖床皆失敗，改用 cloudflared 備援: {tunnel}')
+    return tunnel
+
+  print(
+      '⚠️ 無法取得 LINE 可播影片網址：'
+      'litterbox=500 / catbox=412 時請依賴 uguu/pomf；'
+      '或設定最新 PUBLIC_BASE_URL'
+  )
   return None
 
 
@@ -558,7 +624,7 @@ def send_fall_alert(
     else:
       print(
           '⚠️ 無法建立可播放的 LINE 影片氣泡。'
-          'litterbox 目前常 500；若 catbox 也失敗請稍後重試。'
+          'litterbox/catbox 目前常掛；已改試 uguu/pomf。'
           '照片仍會正常發送。'
       )
 
