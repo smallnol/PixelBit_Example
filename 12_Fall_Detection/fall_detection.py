@@ -14,12 +14,13 @@
 
 主力管道（請維持）：
   • 照片　　→ ImgBB（可設過期秒數，例如 600＝約 10 分鐘後圖床刪檔）
-  • 影片　　→ litterbox（可播；僅支援 1h/12h/24h/72h，最短 1 小時）
-  • 影片封面 → 同用 ImgBB 預覽圖（讓 LINE 影片氣泡有縮圖）
+  • 影片　　→ litterbox 優先（可播；1h/12h/24h/72h）
+  • 影片備援 → litterbox 若 HTTP 500，改試 catbox → tmpfiles
+  • 影片封面 → ImgBB 預覽圖（LINE 影片氣泡縮圖）
 
 相關流程：
   循環緩衝 30 秒 → 疑似跌倒開始組片 → 滿約 10 秒確認
-  → 存本機 → ImgBB 上傳照片／litterbox 上傳影片 → LINE Push
+  → 存本機 → ImgBB 上傳照片／上傳影片 → LINE Push
 
 【照片／影片相關程式位置（函式名）】
 --------------------------------------------------------------------------------
@@ -37,7 +38,8 @@
     decode_rolling_frame / start_suspect_event / append_event_frame
     discard_suspect_event / finalize_confirmed_event
     ensure_line_h264_mp4
-    upload_to_litterbox / resolve_video_url
+    upload_to_litterbox / upload_to_catbox / upload_to_tmpfiles
+    upload_video_for_line / resolve_video_url
 
   組裝並推播 LINE
     send_line_messages / send_fall_alert
@@ -48,7 +50,7 @@
 1. 預設僅骨架預覽（不警報）
 2. 鏡頭持續保留最近約 30 秒（行車紀錄器式；逾時自動覆蓋）
 3. 開啟偵測後姿勢異常 → 用「跌倒前 30 秒 + 倒地過程」組影片
-4. 持續異常滿 FALL_CONFIRM_SECONDS → LINE：文字 + ImgBB 照片 + litterbox 影片
+4. 持續異常滿 FALL_CONFIRM_SECONDS → LINE：文字 + ImgBB 照片 + 影片氣泡
 5. 確認前站起來／關閉偵測 → 刪除暫存
 """
 
@@ -127,7 +129,10 @@ print(
     f'🎥 循環錄影緩衝約 {ROLLING_BUFFER_SECONDS:g} 秒'
     f'（最多 {rolling_maxlen} 幀 @ {CLIP_FPS:g} fps）'
 )
-print(f'☁️ 照片主力 ImgBB｜影片主力 litterbox（保存 {LITTERBOX_KEEP}）')
+print(
+    f'☁️ 照片主力 ImgBB｜影片主力 litterbox（{LITTERBOX_KEEP}）'
+    '；失敗則 catbox/tmpfiles 備援'
+)
 
 
 def _now_stamp() -> str:
@@ -350,14 +355,18 @@ def finalize_confirmed_event(
 
 
 def ensure_line_h264_mp4(video_path: Path) -> Path | None:
-  """轉成 LINE 較相容的 H.264 MP4。"""
+  """轉成較小、LINE 較相容的 H.264 MP4（降低上傳失敗率）。"""
   if video_path is None or not video_path.exists():
     return None
   out_path = video_path.with_name(video_path.stem + '_h264.mp4')
   cmd = [
       'ffmpeg', '-y', '-i', str(video_path),
       '-c:v', 'libx264', '-profile:v', 'baseline', '-level', '3.0',
-      '-pix_fmt', 'yuv420p', '-vf', 'scale=640:-2', '-r', '15',
+      '-pix_fmt', 'yuv420p',
+      '-vf', 'scale=480:-2',
+      '-r', '10',
+      '-crf', '28',
+      '-maxrate', '800k', '-bufsize', '1600k',
       '-movflags', '+faststart', '-an', str(out_path),
   ]
   try:
@@ -373,31 +382,109 @@ def ensure_line_h264_mp4(video_path: Path) -> Path | None:
   return video_path
 
 
-def upload_to_litterbox(file_path: Path) -> str | None:
-  """影片主力：litterbox（自動過期）。"""
+def _upload_headers() -> dict:
+  return {
+      'User-Agent': (
+          'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 '
+          '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      ),
+      'Referer': 'https://litterbox.catbox.moe/',
+  }
+
+
+def upload_to_litterbox(file_path: Path, retries: int = 3) -> str | None:
+  """影片主力：litterbox（自動過期）。遇 500 會重試。"""
+  for attempt in range(1, retries + 1):
+    try:
+      with open(file_path, 'rb') as f:
+        res = requests.post(
+            'https://litterbox.catbox.moe/resources/internals/api.php',
+            data={'reqtype': 'fileupload', 'time': LITTERBOX_KEEP},
+            files={'fileToUpload': (file_path.name, f, 'video/mp4')},
+            headers=_upload_headers(),
+            timeout=180,
+        )
+      text = (res.text or '').strip()
+      if res.status_code == 200 and text.startswith('https://'):
+        print(f'☁️ litterbox 上傳成功（{LITTERBOX_KEEP} 後刪）: {text}')
+        return text
+      print(
+          f'❌ litterbox 上傳失敗 (第 {attempt}/{retries} 次): '
+          f'{res.status_code} {text[:120]!r}'
+      )
+      if res.status_code == 500 and attempt < retries:
+        time.sleep(1.5 * attempt)
+        continue
+    except Exception as e:
+      print(f'❌ litterbox 上傳例外 (第 {attempt}/{retries} 次): {e}')
+      if attempt < retries:
+        time.sleep(1.5 * attempt)
+  return None
+
+
+def upload_to_catbox(file_path: Path) -> str | None:
+  """影片備援：catbox（永久連結；litterbox 掛掉時使用）。"""
   try:
     with open(file_path, 'rb') as f:
       res = requests.post(
-          'https://litterbox.catbox.moe/resources/internals/api.php',
-          data={'reqtype': 'fileupload', 'time': LITTERBOX_KEEP},
+          'https://catbox.moe/user/api.php',
+          data={'reqtype': 'fileupload'},
           files={'fileToUpload': (file_path.name, f, 'video/mp4')},
-          headers={'User-Agent': 'FallDetection/1.0'},
+          headers=_upload_headers(),
           timeout=180,
       )
     text = (res.text or '').strip()
     if res.status_code == 200 and text.startswith('https://'):
-      print(f'☁️ litterbox 上傳成功（{LITTERBOX_KEEP} 後刪）: {text}')
+      print(f'☁️ catbox 備援上傳成功: {text}')
       return text
-    print(f'❌ litterbox 上傳失敗: {res.status_code} {text[:300]!r}')
+    print(f'❌ catbox 備援失敗: {res.status_code} {text[:200]!r}')
   except Exception as e:
-    print(f'❌ litterbox 上傳例外: {e}')
+    print(f'❌ catbox 備援例外: {e}')
+  return None
+
+
+def upload_to_tmpfiles(file_path: Path) -> str | None:
+  """影片備援：tmpfiles.org（轉成 /dl/ 直連）。"""
+  try:
+    with open(file_path, 'rb') as f:
+      res = requests.post(
+          'https://tmpfiles.org/api/v1/upload',
+          files={'file': (file_path.name, f, 'video/mp4')},
+          headers={'User-Agent': 'FallDetection/1.0'},
+          timeout=180,
+      )
+    data = res.json()
+    page_url = (data.get('data') or {}).get('url') or ''
+    if data.get('status') == 'success' and page_url:
+      direct = page_url.replace('http://', 'https://')
+      if '/dl/' not in direct:
+        direct = direct.replace('tmpfiles.org/', 'tmpfiles.org/dl/', 1)
+      print(f'☁️ tmpfiles 備援上傳成功: {direct}')
+      return direct
+    print(f'❌ tmpfiles 備援失敗: {res.status_code} {str(data)[:200]}')
+  except Exception as e:
+    print(f'❌ tmpfiles 備援例外: {e}')
+  return None
+
+
+def upload_video_for_line(file_path: Path) -> str | None:
+  """
+  影片上傳順序：
+  1) litterbox（主力，會過期）
+  2) catbox（litterbox 常回 500 時備援）
+  3) tmpfiles
+  """
+  for uploader in (upload_to_litterbox, upload_to_catbox, upload_to_tmpfiles):
+    url = uploader(file_path)
+    if url and url.startswith('https://'):
+      return url
   return None
 
 
 def resolve_video_url(
     video_path: Path, preview_url: str | None
 ) -> tuple[str | None, str | None]:
-  """回傳 (video_url, preview_url)；影片=litterbox，封面=ImgBB。"""
+  """回傳 (video_url, preview_url)；影片優先 litterbox，封面 ImgBB。"""
   ready = ensure_line_h264_mp4(video_path)
   if ready is None:
     return None, preview_url
@@ -407,8 +494,9 @@ def resolve_video_url(
   except OSError:
     pass
 
-  video_url = upload_to_litterbox(ready)
+  video_url = upload_video_for_line(ready)
   if not video_url:
+    print('⚠️ 所有影片圖床都失敗（litterbox/catbox/tmpfiles）')
     return None, preview_url
 
   if not line_can_embed_image(preview_url):
@@ -491,7 +579,7 @@ def send_fall_alert(
       messages[0]['text'] += f'\n🎬 影片連結:\n{video_url}'
       print(f'🎬 LINE 影片氣泡: {video_url}')
     else:
-      print('⚠️ 無法建立 LINE 影片氣泡（檢查 litterbox／ImgBB）')
+      print('⚠️ 無法建立 LINE 影片氣泡（litterbox 可能 500；已試備援仍失敗／缺 ImgBB 封面）')
 
   for i, msg in enumerate(messages[1:], start=1):
     print(f'📎 LINE 媒體[{i}]: {msg.get("type")} -> {msg.get("originalContentUrl")}')
@@ -778,6 +866,6 @@ if __name__ == '__main__':
     print(f'☁️ ImgBB 已設定｜約 {IMGBB_EXPIRATION_SECONDS / 60:g} 分鐘後圖床刪照片')
   else:
     print('⚠️ 未設定 IMGBB_API_KEY：LINE 照片氣泡可能無法顯示')
-  print(f'🎬 影片主力 litterbox（{LITTERBOX_KEEP} 後刪）')
+  print(f'🎬 影片：litterbox 優先（{LITTERBOX_KEEP}），掛掉時自動改 catbox/tmpfiles')
   print(f'伺服器啟動：http://{HOST}:{PORT}')
   app.run(host=HOST, port=PORT, debug=False, threaded=True)
