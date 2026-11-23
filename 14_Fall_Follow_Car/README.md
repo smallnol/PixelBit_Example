@@ -40,6 +40,8 @@
 ## 檔案
 
 - `PROJECT_HANDBOOK.md` — 專題說明書
+- `DEPLOY.md` — 接線／供電／燒錄／Pi 指令
+- `web_preview/` — **網頁版面預覽**（靜態 HTML，不連 Pi）
 - `fall_follow_car.py` — 主程式
 - `line_media.py` — 跌倒核心
 - `firmware/` — UNO／ESP32 韌體
