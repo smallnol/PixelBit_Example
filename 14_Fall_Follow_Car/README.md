@@ -15,32 +15,20 @@
 
 網頁：`http://樹莓派IP:5001`
 
-## 韌體（必燒）
+## 接線／供電／燒錄／Pi 指令（完整）
 
-見 [`firmware/README.md`](firmware/README.md)：
+請看 **[`DEPLOY.md`](DEPLOY.md)**（含供電規則、每根訊號線、要燒哪些 `.ino`、樹莓派 curl／venv 指令）。
 
-- `firmware/uno_car_vl53/` — UNO + VL53 + Soft-start
-- `firmware/uwb_car_responder/` — ESP32 距離 `D:` + 轉發命令 + 橋接 `O:`
+簡表：
 
-新增接線：**UNO D11 → ESP32 GPIO16**（避障封包回傳）。
+| 板子 | 燒錄檔 |
+|------|--------|
+| 車上 ESP32-UWB | `firmware/uwb_car_responder/uwb_car_responder.ino` |
+| Arduino UNO | `firmware/uno_car_vl53/uno_car_vl53.ino` |
+| 身上 Tag ESP32 | `uwb-follow-car` 的 `uwb_tag_initiator`（沿用） |
+| 樹莓派 | 不燒韌體；跑 `fall_follow_car.py` + `line_media.py` |
 
-## 樹莓派安裝
-
-```bash
-mkdir -p ~/fall_follow && cd ~/fall_follow
-curl -L -o fall_follow_car.py "https://raw.githubusercontent.com/smallnol/PixelBit_Example/cursor/fall-follow-vl53-lock-dash-1509/14_Fall_Follow_Car/fall_follow_car.py"
-curl -L -o line_media.py "https://raw.githubusercontent.com/smallnol/PixelBit_Example/cursor/fall-follow-vl53-lock-dash-1509/14_Fall_Follow_Car/line_media.py"
-curl -L -o requirements.txt "https://raw.githubusercontent.com/smallnol/PixelBit_Example/cursor/fall-follow-vl53-lock-dash-1509/14_Fall_Follow_Car/requirements.txt"
-curl -L -o .env.example "https://raw.githubusercontent.com/smallnol/PixelBit_Example/cursor/fall-follow-vl53-lock-dash-1509/14_Fall_Follow_Car/.env.example"
-
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-nano .env
-mkdir -p events/pending events/confirmed
-python fall_follow_car.py
-```
+★ 新線：**UNO D11 → ESP32 GPIO16**（避障 `O:` 回傳）
 
 ## 操作順序（建議）
 
