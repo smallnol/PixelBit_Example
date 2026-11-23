@@ -1,16 +1,17 @@
 /*
- * UNO R3 + BMP73T104 + 4×VL53L0X｜Pi-slave 馬達 + 避障／防墜
+ * UNO R3 + BMP73T104 + 5×VL53L0X｜Pi-slave 馬達 + 避障／防墜
  *
  * 接線：
  *   ESP32 GPIO17 (TX2) → UNO D10（SoftwareSerial RX，收 F/L/R/Z/S/X）
- *   UNO D11 (SoftSerial TX) → ESP32 GPIO16（回傳 O:mm,mm,mm,mm）
+ *   UNO D11 (SoftSerial TX) → ESP32 GPIO16（回傳 O:mm,...）
  *   GND 共地
  *
  * VL53L0X XSHUT（共用 I2C SDA/SCL）：
  *   [0]左前       D2 → addr 0x30
  *   [1]正前       D3 → addr 0x31
  *   [2]右前       D4 → addr 0x32
- *   [3]前端下視   D5 → addr 0x33  （朝地面；距離變大＝懸空／樓梯邊緣 → 強制停）
+ *   [3]前端下視   D5 → addr 0x33  （朝地面；距離變大＝落差 → 強制停）
+ *   [4]後方       D6 → addr 0x34  （水平朝後；過近時限制自轉搜尋）
  *
  * 庫：Wire、BMP73T104、SoftwareSerial、Pololu VL53L0X
  * USB 監看：115200
@@ -78,13 +79,15 @@ int tgtLeft = 0;
 int tgtRight = 0;
 bool emergencyHold = false;
 
-// --- VL53L0X（4 顆）---
-const uint8_t NUM_TOF = 4;
-const uint8_t XSHUT_PINS[NUM_TOF] = {2, 3, 4, 5};          // D2~D5
-const uint8_t TOF_ADDR[NUM_TOF] = {0x30, 0x31, 0x32, 0x33};
+// --- VL53L0X（5 顆）---
+const uint8_t NUM_TOF = 5;
+const uint8_t XSHUT_PINS[NUM_TOF] = {2, 3, 4, 5, 6};       // D2~D6
+const uint8_t TOF_ADDR[NUM_TOF] = {0x30, 0x31, 0x32, 0x33, 0x34};
 VL53L0X tof[NUM_TOF];
-uint16_t tofMm[NUM_TOF] = {TOF_FAIL_MM, TOF_FAIL_MM, TOF_FAIL_MM, TOF_FAIL_MM};
-bool tofOk[NUM_TOF] = {false, false, false, false};
+uint16_t tofMm[NUM_TOF] = {
+    TOF_FAIL_MM, TOF_FAIL_MM, TOF_FAIL_MM, TOF_FAIL_MM, TOF_FAIL_MM
+};
+bool tofOk[NUM_TOF] = {false, false, false, false, false};
 
 void setSingleMotorSafe(BMP73T104 &motor, int rawSpeed, float trim, int dir) {
   int targetSpeed = constrain((int)(rawSpeed * trim * dir), -100, 100);
@@ -235,7 +238,7 @@ void pollTof() {
 }
 
 void sendTofTelemetry() {
-  // O:左前,正前,右前,下視
+  // O:左前,正前,右前,下視,後方
   piSerial.print(F("O:"));
   for (uint8_t i = 0; i < NUM_TOF; i++) {
     if (i) piSerial.print(',');
@@ -266,6 +269,12 @@ char applyObstacleOverride(char cmd) {
   // 防墜：任何移動指令（F/L/R/Z）遇到懸空 → 強制停
   if (cmd != CMD_STOP && cliffDetected()) {
     Serial.println(F("CLIFF: drop-off -> S"));
+    return CMD_STOP;
+  }
+
+  // 後方過近：自轉搜尋 Z 時強制停
+  if (cmd == CMD_SPIN && tofOk[4] && tofMm[4] < AVOID_MM) {
+    Serial.println(F("AVOID: rear blocked -> S"));
     return CMD_STOP;
   }
 
@@ -390,11 +399,11 @@ void setup() {
   requestedCmd = CMD_STOP;
   lastCmdTime = millis();
 
-  Serial.println(F("=== UNO Pi-slave + 4xVL53 避障/防墜 ==="));
+  Serial.println(F("=== UNO Pi-slave + 5xVL53 避障/防墜 ==="));
   if (!initTofSensors()) {
     Serial.println(F("警告：VL53 全部失敗，避障停用（馬達命令仍可用）"));
   }
-  Serial.println(F("命令 F/L/R/Z/S/X｜O:4｜AVOID 250mm｜CLIFF 150mm"));
+  Serial.println(F("命令 F/L/R/Z/S/X｜O:5｜AVOID 250mm｜CLIFF 150mm"));
 }
 
 void loop() {

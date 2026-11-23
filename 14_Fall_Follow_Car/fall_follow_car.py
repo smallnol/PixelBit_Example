@@ -28,7 +28,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / '.env')
 import line_media as fall  # noqa: E402
 
-APP_VERSION = 'fall-follow-2026-11-23-vl53x4-cliff'
+APP_VERSION = 'fall-follow-2026-11-23-vl53x5-cliff-rear'
 
 # --- 硬體 / 網路 ---
 CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
@@ -77,12 +77,12 @@ TRACKER_CFG = os.getenv('TRACKER_CFG', 'bytetrack.yaml').strip() or 'bytetrack.y
 
 DIST_LINE_RE = re.compile(r'D:\s*([0-9]+(?:\.[0-9]+)?)', re.IGNORECASE)
 DIST_LEGACY_RE = re.compile(r'\[CAR\]\s*([0-9]+(?:\.[0-9]+)?)\s*m', re.IGNORECASE)
-# O:左前,正前,右前,下視
+# O:左前,正前,右前,下視,後方
 TOF_LINE_RE = re.compile(
-    r'O:\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)',
+    r'O:\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)',
     re.IGNORECASE,
 )
-TOF_LABELS = ('左前', '正前', '右前', '下視')
+TOF_LABELS = ('左前', '正前', '右前', '下視', '後方')
 
 app = Flask(__name__)
 
@@ -98,7 +98,7 @@ fall_alert_active = False
 fall_alert_ts = ''
 latest_distance: float | None = None
 last_distance_time = 0.0
-latest_tof_mm = [8190, 8190, 8190, 8190]
+latest_tof_mm = [8190, 8190, 8190, 8190, 8190]
 last_tof_time = 0.0
 latest_cmd = 'S'
 latest_status = '待機'
@@ -211,7 +211,7 @@ class SerialReader:
 
         m_tof = TOF_LINE_RE.search(line)
         if m_tof:
-          vals = [int(m_tof.group(i)) for i in range(1, 5)]
+          vals = [int(m_tof.group(i)) for i in range(1, 6)]
           with state_lock:
             latest_tof_mm = vals
             last_tof_time = time.time()
@@ -954,7 +954,7 @@ INDEX_HTML = """
     img.feed { width: 100%; background: #000; border-radius: 8px; display: block; }
     .pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; max-width: 240px; }
     .pad .spacer { visibility: hidden; }
-    .tof-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+    .tof-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
     .tof {
       background: #111820; border-radius: 8px; padding: 8px 6px; text-align: center; border: 1px solid #2a3542;
     }
@@ -1024,7 +1024,7 @@ INDEX_HTML = """
         </section>
 
         <section class="card">
-          <h2>VL53L0X（mm）前三避障／下視防墜</h2>
+          <h2>VL53L0X（mm）前三避障／下視防墜／後方</h2>
           <div class="tof-grid" id="tofGrid"></div>
           <div class="sub" id="tofAge" style="margin-top:8px">ToF age: --</div>
         </section>
@@ -1080,8 +1080,8 @@ INDEX_HTML = """
     function renderTof(vals, age) {
       const root = document.getElementById('tofGrid');
       root.innerHTML = '';
-      (vals || [8190,8190,8190,8190]).forEach((v, i) => {
-        // 前三顆：太近危險；下視：距離太大＝落差危險
+      (vals || [8190,8190,8190,8190,8190]).forEach((v, i) => {
+        // 前三＋後方：太近危險；下視：距離太大＝落差危險
         const isDown = i === 3;
         const danger = isDown ? (v >= CLIFF) : (v < AVOID);
         const pct = isDown

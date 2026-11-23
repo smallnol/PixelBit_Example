@@ -52,7 +52,7 @@
     }
     .pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; max-width: 240px; }
     .pad .spacer { visibility: hidden; }
-    .tof-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+    .tof-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
     .tof {
       background: #111820; border-radius: 8px; padding: 8px 6px; text-align: center; border: 1px solid #2a3542;
     }
@@ -169,7 +169,7 @@
         </section>
 
         <section class="card">
-          <h2>VL53L0X（mm）前三避障／下視防墜</h2>
+          <h2>VL53L0X（mm）前三／下視／後方</h2>
           <div class="tof-grid" id="tofGrid"></div>
           <div class="sub" id="tofAge" style="margin-top:8px">ToF age: --</div>
         </section>
@@ -185,7 +185,7 @@
   <script>
     const AVOID = 250;
     const CLIFF = 150;
-    const LABELS = ['左前', '正前', '右前', '下視'];
+    const LABELS = ['左前', '正前', '右前', '下視', '後方'];
     let holdTimer = null;
 
     // 模擬 /api/status
@@ -202,7 +202,7 @@
       distance: 2.15,
       distance_age: 0.12,
       uwb_stale_seconds: 1.0,
-      tof_mm: [620, 780, 640, 55],
+      tof_mm: [620, 780, 640, 55, 900],
       tof_age: 0.18,
       person_seen: true,
       offset: 0.04,
@@ -367,7 +367,7 @@
       refresh();
     }
     function demoNearObstacle() {
-      mock.tof_mm = [180, 210, 190, 220];  // 下視變大＝落差
+      mock.tof_mm = [180, 210, 190, 220, 900];  // 下視變大＝落差
       mock.tof_age = 0.1;
       refresh();
     }
@@ -382,7 +382,7 @@
       mock.fall_alert_ts = '';
       mock.distance = 2.15;
       mock.distance_age = 0.12;
-      mock.tof_mm = [620, 780, 640, 55];
+      mock.tof_mm = [620, 780, 640, 55, 900];
       mock.tof_age = 0.18;
       mock.locked_target_id = 3;
       mock.person_seen = true;
