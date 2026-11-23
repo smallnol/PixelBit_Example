@@ -23,11 +23,12 @@ from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template_string, send_file
 from ultralytics import YOLO
 
-import line_media as fall
-
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / '.env')
-APP_VERSION = 'fall-follow-2026-11-23'
+# 先載 .env 再 import，確保 FALL_SENSITIVITY 等讀到同一份設定
+import line_media as fall  # noqa: E402
+
+APP_VERSION = 'fall-follow-2026-11-23-core-sync'
 
 # --- 硬體 / 網路 ---
 CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
@@ -685,7 +686,7 @@ INDEX_HTML = """
     <img src="/video_feed" alt="camera"/>
     <div id="status">載入中…</div>
     <p class="hint">
-      置中死區 ±{{ deadzone }}｜前進 ≥ {{ start }}m｜停止 &lt; {{ stop }}m｜跌倒確認 {{ confirm }}s<br/>
+      置中死區 ±{{ deadzone }}｜前進 ≥ {{ start }}m｜停止 &lt; {{ stop }}m｜跌倒確認 {{ confirm }}s｜靈敏度 {{ sens }}<br/>
       UWB/Motor: {{ uwb }}｜version {{ version }}
     </p>
   </main>
@@ -724,6 +725,7 @@ def index():
       start=START_DIST,
       stop=STOP_DIST,
       confirm=fall.FALL_CONFIRM_SECONDS,
+      sens=fall.FALL_SENSITIVITY,
       uwb=UWB_SERIAL_PORT,
       version=APP_VERSION,
   )
@@ -817,6 +819,7 @@ def status():
 if __name__ == '__main__':
   print(f'=== APP_VERSION={APP_VERSION} ===', flush=True)
   print(f'=== FILE={Path(__file__).resolve()} ===', flush=True)
+  print(f'=== FALL_SENSITIVITY={fall.FALL_SENSITIVITY:g} ===', flush=True)
   uwb_reader.start()
   motor.open()
   print('=== STARTING CONTROL THREAD ===', flush=True)

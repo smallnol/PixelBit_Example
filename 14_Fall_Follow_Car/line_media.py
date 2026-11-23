@@ -1,6 +1,5 @@
-"""跌倒偵測核心（姿勢/錄影/LINE），供 fall_follow_car 引用。"""
+"""跌倒偵測核心（最新）：姿勢/錄影/LINE，供 fall_follow_car 引用。不含 Flask 主迴圈。"""
 from __future__ import annotations
-
 
 
 import base64
@@ -48,6 +47,12 @@ FALL_CONFIRM_SECONDS = 10.0
 ALERT_COOLDOWN_SECONDS = 30.0
 # 行車紀錄器式：持續保留最近 N 秒；沒跌倒就隨時間自動覆蓋刪除
 ROLLING_BUFFER_SECONDS = float(os.getenv('ROLLING_BUFFER_SECONDS', '30'))
+# 跌倒靈敏度：1.0=偏嚴（幾乎要躺平），預設 1.45 可抓蹲下／半倒；越大越敏感
+try:
+  FALL_SENSITIVITY = float(os.getenv('FALL_SENSITIVITY', '1.45'))
+except ValueError:
+  FALL_SENSITIVITY = 1.45
+FALL_SENSITIVITY = max(0.8, min(FALL_SENSITIVITY, 2.5))
 CLIP_FPS = 10.0
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
@@ -69,8 +74,12 @@ print(
     f'（最多 {rolling_maxlen} 幀 @ {CLIP_FPS:g} fps；無跌倒會自動覆蓋）'
 )
 print(
-    f'☁️ 影片上傳 litterbox 保存 {LITTERBOX_KEEP}'
-    '（此服務最短 1 小時，無法設 10 分鐘）'
+    f'☁️ 影片上傳優先 litterbox（{LITTERBOX_KEEP}）；'
+    '若掛掉則改 uguu/pomf（約數小時自動刪）'
+)
+print(
+    f'🎯 跌倒靈敏度 FALL_SENSITIVITY={FALL_SENSITIVITY:g} '
+    '（越大越敏感；蹲下也較容易觸發，桌前坐姿仍會排除）'
 )
 
 
@@ -148,6 +157,8 @@ def is_direct_https_media_url(url: str) -> bool:
           'ibb.co/',
           'files.catbox.moe/',
           'litter.catbox.moe/',
+          'uguu.se/',
+          'pomf2.lain.la/',
           '0x0.st/',
       )
   ):
@@ -211,21 +222,56 @@ def upload_to_telegraph(image_path: Path) -> str | None:
   return None
 
 
-def _upload_headers() -> dict:
-  return {
-      'User-Agent': 'Mozilla/5.0 (X11; Linux aarch64) FallDetection/1.0',
-  }
+def _browser_ua() -> str:
+  return (
+      'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  )
+
+
+def line_can_embed_video(url: str | None) -> bool:
+  """LINE 影片氣泡可用的直連 HTTPS mp4 主機。"""
+  if not url:
+    return False
+  u = url.lower()
+  if not u.startswith('https://'):
+    return False
+  hosts = (
+      'litter.catbox.moe/',
+      'files.catbox.moe/',
+      'uguu.se/',
+      'pomf2.lain.la/',
+      'lain.la/',
+      'trycloudflare.com/',
+  )
+  if any(h in u for h in hosts):
+    return True
+  # 自架 cloudflared / PUBLIC_BASE_URL：路徑需是 .mp4
+  if PUBLIC_BASE_URL and u.startswith(PUBLIC_BASE_URL.lower()) and u.endswith('.mp4'):
+    return True
+  return False
 
 
 def upload_to_catbox(file_path: Path) -> str | None:
-  """上傳影片到 catbox（最早「點氣泡可播」常用的直連方式）。"""
+  """
+  litterbox 姊妹站。目前常回 412 Invalid uploader（對方擋 IP／VPN／機房網段），
+  不是本機參數能修好的；失敗就改走 uguu/pomf。
+  """
+  headers = {
+      'User-Agent': _browser_ua(),
+      'Referer': 'https://catbox.moe/',
+  }
+  data = {'reqtype': 'fileupload'}
+  userhash = os.getenv('CATBOX_USERHASH', '').strip()
+  if userhash:
+    data['userhash'] = userhash
   try:
     with open(file_path, 'rb') as f:
       res = requests.post(
           'https://catbox.moe/user/api.php',
-          data={'reqtype': 'fileupload'},
-          files={'fileToUpload': (file_path.name, f, 'video/mp4')},
-          headers=_upload_headers(),
+          data=data,
+          files={'fileToUpload': (file_path.name, f, 'application/octet-stream')},
+          headers=headers,
           timeout=180,
       )
     text = (res.text or '').strip()
@@ -233,48 +279,125 @@ def upload_to_catbox(file_path: Path) -> str | None:
     if res.status_code == 200 and text.startswith('https://'):
       print(f'☁️ catbox 上傳成功: {text}')
       return text
-    print(f'❌ catbox 上傳失敗: {res.status_code} {text[:300]!r}')
+    if res.status_code == 412 or 'invalid uploader' in text.lower():
+      print('⚠️ catbox 拒絕上傳（Invalid uploader＝對方擋來源 IP，非程式錯誤）')
+    else:
+      print(f'❌ catbox 上傳失敗: {res.status_code} {text[:300]!r}')
   except Exception as e:
     print(f'❌ catbox 上傳例外: {e}')
   return None
 
 
 def upload_to_litterbox(file_path: Path, keep: str | None = None) -> str | None:
-  """catbox 姊妹站，檔案會自動過期（僅 1h/12h/24h/72h）。"""
+  """影片理想主力（會過期）；目前常 500，失敗就改走其他圖床。"""
   keep = keep or LITTERBOX_KEEP
+  headers = {
+      'User-Agent': _browser_ua(),
+      'Referer': 'https://litterbox.catbox.moe/',
+  }
+  for attempt in range(1, 3):
+    try:
+      with open(file_path, 'rb') as f:
+        res = requests.post(
+            'https://litterbox.catbox.moe/resources/internals/api.php',
+            data={'reqtype': 'fileupload', 'time': keep},
+            files={'fileToUpload': (file_path.name, f, 'application/octet-stream')},
+            headers=headers,
+            timeout=180,
+        )
+      text = (res.text or '').strip()
+      print(f'☁️ litterbox 回應: status={res.status_code} body={text[:200]!r}')
+      if res.status_code == 200 and text.startswith('https://'):
+        print(f'☁️ litterbox 上傳成功（{keep} 後刪）: {text}')
+        return text
+      print(f'❌ litterbox 上傳失敗 (第 {attempt}/2): {res.status_code}')
+      if res.status_code == 500 and attempt == 1:
+        time.sleep(1.5)
+        continue
+    except Exception as e:
+      print(f'❌ litterbox 上傳例外: {e}')
+  return None
+
+
+def upload_to_uguu(file_path: Path) -> str | None:
+  """uguu.se：直連 video/mp4，檔案約數小時後自動刪（適合短效通報）。"""
+  headers = {'User-Agent': _browser_ua()}
   try:
     with open(file_path, 'rb') as f:
       res = requests.post(
-          'https://litterbox.catbox.moe/resources/internals/api.php',
-          data={'reqtype': 'fileupload', 'time': keep},
-          files={'fileToUpload': (file_path.name, f, 'video/mp4')},
-          headers=_upload_headers(),
+          'https://uguu.se/upload',
+          files={'files[]': (file_path.name, f, 'video/mp4')},
+          headers=headers,
           timeout=180,
       )
-    text = (res.text or '').strip()
-    print(f'☁️ litterbox 回應: status={res.status_code} body={text[:200]!r}')
-    if res.status_code == 200 and text.startswith('https://'):
-      print(f'☁️ litterbox 上傳成功（{keep} 後刪）: {text}')
-      return text
-    print(f'❌ litterbox 上傳失敗: {res.status_code} {text[:300]!r}')
+    data = res.json()
+    if res.status_code == 200 and data.get('success'):
+      files = data.get('files') or []
+      if files and isinstance(files[0], dict):
+        url = (files[0].get('url') or '').strip()
+        if url.startswith('https://'):
+          print(f'☁️ uguu 上傳成功（短效自動刪）: {url}')
+          return url
+    print(f'❌ uguu 上傳失敗: {res.status_code} {str(data)[:300]!r}')
   except Exception as e:
-    print(f'❌ litterbox 上傳例外: {e}')
+    print(f'❌ uguu 上傳例外: {e}')
+  return None
+
+
+def upload_to_pomf(file_path: Path) -> str | None:
+  """pomf.lain.la：直連 video/mp4 備援。"""
+  headers = {'User-Agent': _browser_ua()}
+  try:
+    with open(file_path, 'rb') as f:
+      res = requests.post(
+          'https://pomf.lain.la/upload.php',
+          files={'files[]': (file_path.name, f, 'video/mp4')},
+          headers=headers,
+          timeout=180,
+      )
+    data = res.json()
+    if res.status_code == 200 and data.get('success'):
+      files = data.get('files') or []
+      if files and isinstance(files[0], dict):
+        url = (files[0].get('url') or '').strip()
+        if url.startswith('https://'):
+          print(f'☁️ pomf 上傳成功: {url}')
+          return url
+    print(f'❌ pomf 上傳失敗: {res.status_code} {str(data)[:300]!r}')
+  except Exception as e:
+    print(f'❌ pomf 上傳例外: {e}')
   return None
 
 
 def upload_video_for_line(video_path: Path) -> str | None:
   """
-  影片優先 litterbox（你目前可播且會自動刪），其次 catbox，最後 cloudflared。
+  影片上傳順序：
+  1) litterbox（會過期；目前常 500）
+  2) catbox（目前常 412 Invalid uploader＝對方擋 IP）
+  3) uguu（短效自動刪，直連 mp4）
+  4) pomf（直連 mp4 備援）
+  5) cloudflared PUBLIC_BASE_URL（需隧道網址新鮮）
   """
-  for uploader in (upload_to_litterbox, upload_to_catbox):
+  for uploader in (
+      upload_to_litterbox,
+      upload_to_catbox,
+      upload_to_uguu,
+      upload_to_pomf,
+  ):
     url = uploader(video_path)
-    if url and url.startswith('https://'):
+    if url and line_can_embed_video(url):
       return url
 
   tunnel = public_media_url(video_path)
-  if tunnel:
-    print(f'🔗 圖床失敗，改用 cloudflared 備援: {tunnel}')
+  if tunnel and line_can_embed_video(tunnel):
+    print(f'🔗 圖床皆失敗，改用 cloudflared 備援: {tunnel}')
     return tunnel
+
+  print(
+      '⚠️ 無法取得 LINE 可播影片網址：'
+      'litterbox=500 / catbox=412 時請依賴 uguu/pomf；'
+      '或設定最新 PUBLIC_BASE_URL'
+  )
   return None
 
 
@@ -396,7 +519,7 @@ def resolve_video_url(video_path: Path, preview_url: str | None) -> tuple[Path |
 
   video_url = upload_video_for_line(ready)
   if not video_url:
-    print('⚠️ catbox/litterbox/cloudflared 都無法提供影片網址')
+    print('⚠️ litterbox/catbox 都無法提供影片網址')
     return ready, None, preview_url
   print(f'🎬 影片網址: {video_url}')
 
@@ -446,7 +569,7 @@ def send_fall_alert(
     preview_path: Path,
     video_path: Path | None = None,
 ) -> None:
-  """推播文字 + ImgBB 照片 + cloudflared 影片氣泡（可點開播放）。"""
+  """推播文字 + ImgBB 照片 + litterbox/catbox 影片氣泡（可點開播放）。"""
   messages: list[dict] = [{'type': 'text', 'text': message_text}]
 
   original_url, preview_url = resolve_image_urls(original_path, preview_path)
@@ -471,7 +594,12 @@ def send_fall_alert(
 
   if video_path and video_path.exists():
     _ready, video_url, video_preview = resolve_video_url(video_path, preview_url)
-    if video_url and video_preview:
+    if (
+        video_url
+        and video_preview
+        and line_can_embed_video(video_url)
+        and line_can_embed_image(video_preview)
+    ):
       messages.append(
           {
               'type': 'video',
@@ -483,9 +611,9 @@ def send_fall_alert(
       print(f'🎬 將以 LINE 影片氣泡發送: {video_url}')
     else:
       print(
-          '⚠️ 無法建立 LINE 影片氣泡。請確認：'
-          '1) cloudflared 有在跑  2) .env 的 PUBLIC_BASE_URL 是最新 https 網址  '
-          '3) 程式已重開讀到新網址'
+          '⚠️ 無法建立可播放的 LINE 影片氣泡。'
+          'litterbox/catbox 目前常掛；已改試 uguu/pomf。'
+          '照片仍會正常發送。'
       )
 
   if len(messages) > 1:
@@ -618,44 +746,111 @@ def finalize_confirmed_event(event: dict, annotated_frame: np.ndarray) -> tuple[
   return confirmed_original, confirmed_preview, confirmed_video
 
 
+def _kp_xy(keypoints, idx: int, min_conf: float = 0.25) -> tuple[float, float] | None:
+  """讀取 COCO keypoint；信心不足則回 None。"""
+  x, y, c = float(keypoints[idx][0]), float(keypoints[idx][1]), float(keypoints[idx][2])
+  if c < min_conf:
+    return None
+  return x, y
+
+
+def _avg_point(
+    a: tuple[float, float] | None,
+    b: tuple[float, float] | None,
+) -> tuple[float, float] | None:
+  if a and b:
+    return ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+  return a or b
+
+
 def analyze_pose(result) -> tuple[bool, bool, bool, float, float, float] | None:
-  """回傳 (is_fall, lateral, frontal, aspect_ratio, torso_height, avg_shoulder_y)。"""
+  """
+  回傳 (is_fall, lateral, frontal, aspect_ratio, torso_height, avg_shoulder_y)。
+
+  目標：
+  - 桌前坐姿／低頭打字 → 不報
+  - 蹲下、半倒、躺平 → 依 FALL_SENSITIVITY 可報（預設偏敏感）
+  """
   if len(result.boxes) == 0 or result.keypoints is None or len(result.keypoints.data) == 0:
     return None
 
   box = result.boxes.xywh[0]
+  cx, cy = float(box[0]), float(box[1])
   w, h = float(box[2]), float(box[3])
   if h <= 1e-6:
     return None
   aspect_ratio = round(w / h, 2)
+  sens = FALL_SENSITIVITY
 
   keypoints = result.keypoints.data[0]
-  # COCO: 5/6 肩膀, 11/12 髖
-  confs = [float(keypoints[i][2]) for i in (5, 6, 11, 12)]
-  if min(confs) < 0.3:
-    # 關鍵點太不可靠時，僅用寬高比做側向判斷
-    is_fall_lateral = aspect_ratio > 1.1
-    is_fall_frontal = False
-    return (
-        is_fall_lateral or is_fall_frontal,
-        is_fall_lateral,
-        is_fall_frontal,
-        aspect_ratio,
-        -1.0,
-        -1.0,
-    )
+  # COCO: 0鼻 5/6肩 9/10腕 11/12髖 13/14膝
+  nose = _kp_xy(keypoints, 0)
+  l_sh = _kp_xy(keypoints, 5)
+  r_sh = _kp_xy(keypoints, 6)
+  l_hip = _kp_xy(keypoints, 11)
+  r_hip = _kp_xy(keypoints, 12)
+  l_wr = _kp_xy(keypoints, 9)
+  r_wr = _kp_xy(keypoints, 10)
+  l_knee = _kp_xy(keypoints, 13)
+  r_knee = _kp_xy(keypoints, 14)
 
-  l_shoulder_y = float(keypoints[5][1])
-  r_shoulder_y = float(keypoints[6][1])
-  l_hip_y = float(keypoints[11][1])
-  r_hip_y = float(keypoints[12][1])
+  shoulder = _avg_point(l_sh, r_sh)
+  hip = _avg_point(l_hip, r_hip)
+  wrist = _avg_point(l_wr, r_wr)
+  knee = _avg_point(l_knee, r_knee)
 
-  avg_shoulder_y = (l_shoulder_y + r_shoulder_y) / 2
-  avg_hip_y = (l_hip_y + r_hip_y) / 2
+  # 關鍵點不可靠：寬扁 + 人在畫面偏下才當側摔（避免桌前側坐）
+  if shoulder is None or hip is None:
+    box_low = cy > (FRAME_HEIGHT * (0.58 - 0.08 * (sens - 1.0)))
+    is_fall_lateral = aspect_ratio > (1.30 - 0.12 * (sens - 1.0)) and box_low
+    return (is_fall_lateral, is_fall_lateral, False, aspect_ratio, -1.0, -1.0)
+
+  avg_shoulder_y = shoulder[1]
+  avg_hip_y = hip[1]
   torso_height = abs(avg_hip_y - avg_shoulder_y)
+  head_y = nose[1] if nose else avg_shoulder_y
+  head_to_hip = abs(avg_hip_y - head_y)
 
-  is_fall_lateral = aspect_ratio > 1.1
-  is_fall_frontal = (torso_height < 40) and (avg_shoulder_y > 220)
+  # --- 桌前坐姿排除（只擋「操作桌面」，不擋蹲下）---
+  desk_pose = False
+  if wrist is not None:
+    wrist_near_hip = abs(wrist[1] - avg_hip_y) < max(80.0, 0.40 * h)
+    head_above_wrist = (wrist[1] - head_y) > max(35.0, 0.15 * h)
+    # 肩膀仍偏畫面上方＝坐著，不是蹲在地上
+    shoulders_mid_high = avg_shoulder_y < (FRAME_HEIGHT * 0.42)
+    desk_pose = wrist_near_hip and head_above_wrist and shoulders_mid_high
+
+  if desk_pose:
+    return (False, False, False, aspect_ratio, torso_height, avg_shoulder_y)
+
+  # --- 跌倒／蹲下條件（數值隨 FALL_SENSITIVITY 放寬）---
+  # 軀幹「夠扁」門檻：敏感度越高，允許越大的 torso_height 仍算倒地
+  torso_limit = max(70.0, 0.36 * h) * sens
+  head_hip_limit = max(95.0, 0.48 * h) * sens
+  shoulder_low_y = FRAME_HEIGHT * (0.40 - 0.06 * (sens - 1.0))
+  aspect_lateral = 1.28 - 0.15 * (sens - 1.0)
+
+  torso_compressed = torso_height < torso_limit
+  head_compressed = head_to_hip < head_hip_limit
+  body_low = avg_shoulder_y > shoulder_low_y
+
+  knees_tucked = False
+  if knee is not None:
+    knees_tucked = abs(knee[1] - avg_hip_y) < (max(55.0, 0.32 * h) * sens)
+
+  # 側摔：框偏扁 + 人偏低 + 軀幹有壓縮
+  is_fall_lateral = (
+      aspect_ratio > aspect_lateral and body_low and torso_compressed
+  )
+  # 正面倒／半倒：人偏低 + 頭髖距離壓縮
+  is_fall_frontal = (
+      body_low and head_compressed and torso_compressed and aspect_ratio < 1.85
+  )
+  # 蹲下：膝蓋靠近髖 + 肩膀偏低（不算桌前坐姿）
+  is_fall_crouch = body_low and knees_tucked and head_compressed
+  if is_fall_crouch:
+    is_fall_frontal = True
+
   is_currently_falling = is_fall_lateral or is_fall_frontal
   return (
       is_currently_falling,
