@@ -343,23 +343,29 @@ python3 fall_follow_car.py
 
 ---
 
+## 八加、進階整合（VL53 避障 × 特定人鎖定 × 網頁儀表板）
+
+1. **5×VL53L0X**：UNO 底層避障（前進遇障強制 L／R／S），`O:mm,...` 經 ESP32 回 Pi 網頁；`X` 最高優先。韌體見 `firmware/`。
+2. **ByteTrack + HSV Re-ID**：鎖定單一目標後，跟隨與跌倒只看該人；路人灰框 `IGNORED`。
+3. **網頁擴充**：鎖定／解除、手動遙控（跟隨 ON 互鎖）、UWB／ToF 儀表板、跌倒警報橫幅。
+
 ## 九、風險、限制與未來工作
 
 ### 9.1 已知限制
 
 - 單相機視野外無法視覺跟隨；依賴 `Z` 搜尋。
-- 光線、遮擋、多人會影響 YOLO 穩定性（目前偏「主體一人」假設）。
-- UWB 受環境、天線、遮擋影響；stale 機制寧可停。
+- 光線、遮擋仍影響追蹤；HSV Re-ID 在相似衣著多人時可能誤綁。
+- UWB／ToF 受環境影響；stale 機制寧可停。
+- SoftSerial 雙向需額外接 **UNO D11→ESP32 GPIO16**。
 - 圖床第三方服務可能間歇失敗；備援鏈降低但無法保證 100%。
 - 非醫療認證；展示與課程用途為主。
 
 ### 9.2 未來可延伸（報告「展望」）
 
 1. **MaUWB AOA**：角度 + 距離，弱光／背對相機時仍可粗跟隨。
-2. **前視避障**（ToF／超音波／深度相機）閉環減速或繞行。
-3. **多人 ID／指定跟隨對象**（ReID 或穿戴 Tag 綁定）。
-4. **本地語音／蜂鳴器**雙通道警報（不只 LINE）。
-5. **資料集微調**跌倒姿態，降低對通用 COCO 關鍵點规则的依賴。
+2. **更強 Re-ID**（深度特徵／穿戴 Tag 綁定）。
+3. **本地語音／蜂鳴器**雙通道警報（不只 LINE）。
+4. **資料集微調**跌倒姿態，降低對通用 COCO 關鍵點規則的依賴。
 
 ---
 
@@ -367,14 +373,14 @@ python3 fall_follow_car.py
 
 | 項目 | 位置 |
 |------|------|
-| 整合 PR | https://github.com/smallnol/PixelBit_Example/pull/4 |
-| 整合目錄 | https://github.com/smallnol/PixelBit_Example/tree/cursor/fall-follow-combine-1509/14_Fall_Follow_Car |
-| 本說明書 | `14_Fall_Follow_Car/PROJECT_HANDBOOK.md`（本檔） |
+| 基礎整合 PR | https://github.com/smallnol/PixelBit_Example/pull/4 |
+| VL53／鎖定／儀表板分支 | `cursor/fall-follow-vl53-lock-dash-1509` |
+| 整合目錄 | `14_Fall_Follow_Car/` |
+| 本說明書 | `14_Fall_Follow_Car/PROJECT_HANDBOOK.md` |
 | 跌倒單模組 | `12_Fall_Detection/` |
 | 跟隨單模組 | `13_Vision_UWB_Follow/` |
-| 最新跌倒核心來源分支 | `cursor/fall-detection-line-media-5500` |
 
-主程式版本字串（整合同步後）：`fall-follow-2026-11-23-core-sync`。
+主程式版本字串：`fall-follow-2026-11-23-vl53-lock-dash`。
 
 ---
 
