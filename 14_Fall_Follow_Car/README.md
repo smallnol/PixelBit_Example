@@ -52,6 +52,7 @@ python fall_follow_car.py
 
 ## 檔案
 
+- `PROJECT_HANDBOOK.md`：**專題說明書**（理念、架構、功能、演示腳本；給報告／其他聊天用）
 - `fall_follow_car.py`：主程式（Flask + 控制迴圈）
 - `line_media.py`：跌倒錄影／LINE 上傳
 - `test_motor_relay.py`：可選，測馬達轉發
