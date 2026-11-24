@@ -41,6 +41,7 @@
 ## 檔案
 
 - `PROJECT_HANDBOOK.md` — 專題說明書
+- `專題問答.txt` — 口試／報告備稿（核心功能、應用、架構、限制）
 - `DEPLOY.md` — 接線／供電／燒錄／Pi 指令
 - `web_preview/` — **網頁版面預覽**（靜態 HTML，不連 Pi）
 - `fall_follow_car.py` — 主程式
