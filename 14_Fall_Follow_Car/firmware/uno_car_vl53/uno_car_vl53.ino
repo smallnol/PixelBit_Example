@@ -220,7 +220,8 @@ bool isValidCmd(char c) {
 
 uint16_t readTofMm(uint8_t i) {
   if (!tofOk[i]) return TOF_FAIL_MM;
-  uint16_t mm = tof[i].readRangeContinuousMillimeters();
+  // 單次測距比 continuous 在多顆＋SoftSerial 忙碌時較穩
+  uint16_t mm = tof[i].readRangeSingleMillimeters();
   if (tof[i].timeoutOccurred() || mm == 0) return TOF_FAIL_MM;
   if (mm > TOF_FAIL_MM) mm = TOF_FAIL_MM;
   return mm;
@@ -349,28 +350,39 @@ bool initTofSensors() {
   for (uint8_t i = 0; i < NUM_TOF; i++) {
     pinMode(XSHUT_PINS[i], OUTPUT);
     digitalWrite(XSHUT_PINS[i], LOW);
+    tofOk[i] = false;
   }
-  delay(20);
+  delay(100);
 
   bool any = false;
   for (uint8_t i = 0; i < NUM_TOF; i++) {
     digitalWrite(XSHUT_PINS[i], HIGH);
-    delay(15);
-    tof[i].setTimeout(200);
+    delay(50);  // 給克隆板較長上電時間
+    tof[i].setTimeout(500);
     if (!tof[i].init()) {
       Serial.print(F("VL53 init FAIL idx="));
       Serial.println(i);
-      tofOk[i] = false;
+      // 失敗維持 HIGH 以免誤回 0x29 搶線；若持續失敗可改拔該顆
       continue;
     }
     tof[i].setAddress(TOF_ADDR[i]);
-    tof[i].startContinuous();
-    tofOk[i] = true;
-    any = true;
+    delay(10);
+    // 開機試讀：擋住應 < 500；一直 8190 代表這顆不能用
+    uint16_t probe = tof[i].readRangeSingleMillimeters();
+    bool probeFail = tof[i].timeoutOccurred() || probe == 0 || probe >= 8000;
     Serial.print(F("VL53 OK idx="));
     Serial.print(i);
     Serial.print(F(" addr=0x"));
-    Serial.println(TOF_ADDR[i], HEX);
+    Serial.print(TOF_ADDR[i], HEX);
+    Serial.print(F(" probe="));
+    Serial.print(probe);
+    if (probeFail) {
+      Serial.println(F(" (讀值異常，仍標記可用，請用手擋測試)"));
+    } else {
+      Serial.println(F(" mm"));
+    }
+    tofOk[i] = true;
+    any = true;
   }
   return any;
 }
@@ -381,7 +393,7 @@ void setup() {
   delay(400);
 
   Wire.begin();
-  Wire.setClock(100000);
+  Wire.setClock(50000);  // 多顆長杜邦線時降速較穩
   delay(200);
 
   myM1.begin(M1); delay(80);
