@@ -333,11 +333,18 @@ void pollPiCommands() {
       bool force = (execCmd != activeCmd) || (cmd == CMD_BRAKE);
       setActiveCommand(execCmd, force);
 
-      Serial.print(F("CMD req="));
-      Serial.write(cmd);
-      Serial.print(F(" exec="));
-      Serial.write(execCmd);
-      Serial.println();
+      // 相同停命令不刷屏（避免洗序列埠／拖慢 I2C）
+      static char lastLogReq = 0;
+      static char lastLogExec = 0;
+      if (cmd != lastLogReq || execCmd != lastLogExec || cmd == CMD_BRAKE) {
+        Serial.print(F("CMD req="));
+        Serial.write(cmd);
+        Serial.print(F(" exec="));
+        Serial.write(execCmd);
+        Serial.println();
+        lastLogReq = cmd;
+        lastLogExec = execCmd;
+      }
     } else if (idx < sizeof(buf) - 1) {
       buf[idx++] = c;
     } else {
@@ -346,42 +353,62 @@ void pollPiCommands() {
   }
 }
 
+bool initOneTof(uint8_t i) {
+  digitalWrite(XSHUT_PINS[i], HIGH);
+  delay(80);
+  tof[i].setTimeout(500);
+  if (!tof[i].init()) {
+    return false;
+  }
+  tof[i].setAddress(TOF_ADDR[i]);
+  delay(20);
+  // 試讀最多 3 次，排除偶發 65535
+  uint16_t probe = 65535;
+  for (uint8_t t = 0; t < 3; t++) {
+    probe = tof[i].readRangeSingleMillimeters();
+    if (!tof[i].timeoutOccurred() && probe > 0 && probe < 8000) break;
+    delay(30);
+  }
+  bool probeFail = tof[i].timeoutOccurred() || probe == 0 || probe >= 8000;
+  Serial.print(F("VL53 OK idx="));
+  Serial.print(i);
+  Serial.print(F(" addr=0x"));
+  Serial.print(TOF_ADDR[i], HEX);
+  Serial.print(F(" probe="));
+  Serial.print(probe);
+  if (probeFail) {
+    Serial.println(F(" (讀值異常，仍標記可用，請用手擋測試)"));
+  } else {
+    Serial.println(F(" mm"));
+  }
+  tofOk[i] = true;
+  return true;
+}
+
 bool initTofSensors() {
   for (uint8_t i = 0; i < NUM_TOF; i++) {
     pinMode(XSHUT_PINS[i], OUTPUT);
     digitalWrite(XSHUT_PINS[i], LOW);
     tofOk[i] = false;
   }
-  delay(100);
+  delay(150);
 
   bool any = false;
   for (uint8_t i = 0; i < NUM_TOF; i++) {
-    digitalWrite(XSHUT_PINS[i], HIGH);
-    delay(50);  // 給克隆板較長上電時間
-    tof[i].setTimeout(500);
-    if (!tof[i].init()) {
+    if (!initOneTof(i)) {
       Serial.print(F("VL53 init FAIL idx="));
-      Serial.println(i);
-      // 失敗維持 HIGH 以免誤回 0x29 搶線；若持續失敗可改拔該顆
-      continue;
+      Serial.print(i);
+      Serial.println(F(" -> retry"));
+      digitalWrite(XSHUT_PINS[i], LOW);
+      delay(50);
+      if (!initOneTof(i)) {
+        Serial.print(F("VL53 init FAIL idx="));
+        Serial.println(i);
+        digitalWrite(XSHUT_PINS[i], LOW);  // 失敗就關掉，避免佔 0x29
+        tofOk[i] = false;
+        continue;
+      }
     }
-    tof[i].setAddress(TOF_ADDR[i]);
-    delay(10);
-    // 開機試讀：擋住應 < 500；一直 8190 代表這顆不能用
-    uint16_t probe = tof[i].readRangeSingleMillimeters();
-    bool probeFail = tof[i].timeoutOccurred() || probe == 0 || probe >= 8000;
-    Serial.print(F("VL53 OK idx="));
-    Serial.print(i);
-    Serial.print(F(" addr=0x"));
-    Serial.print(TOF_ADDR[i], HEX);
-    Serial.print(F(" probe="));
-    Serial.print(probe);
-    if (probeFail) {
-      Serial.println(F(" (讀值異常，仍標記可用，請用手擋測試)"));
-    } else {
-      Serial.println(F(" mm"));
-    }
-    tofOk[i] = true;
     any = true;
   }
   return any;
@@ -389,12 +416,20 @@ bool initTofSensors() {
 
 void setup() {
   Serial.begin(115200);
-  piSerial.begin(9600);
   delay(400);
 
   Wire.begin();
   Wire.setClock(50000);  // 多顆長杜邦線時降速較穩
   delay(200);
+
+  // 先初始化 VL53，再開 SoftSerial，減少開機被 Pi 命令洗版
+  Serial.println(F("=== UNO Pi-slave + 4xVL53 避障 ==="));
+  if (!initTofSensors()) {
+    Serial.println(F("警告：VL53 全部失敗，避障停用（馬達命令仍可用）"));
+  }
+
+  piSerial.begin(9600);
+  delay(50);
 
   myM1.begin(M1); delay(80);
   myM2.begin(M2); delay(80);
@@ -407,10 +442,6 @@ void setup() {
   requestedCmd = CMD_STOP;
   lastCmdTime = millis();
 
-  Serial.println(F("=== UNO Pi-slave + 4xVL53 避障 ==="));
-  if (!initTofSensors()) {
-    Serial.println(F("警告：VL53 全部失敗，避障停用（馬達命令仍可用）"));
-  }
   Serial.println(F("命令 F/L/R/Z/S/X｜O:4｜AVOID 250mm｜rear Z｜side L/R"));
 }
 

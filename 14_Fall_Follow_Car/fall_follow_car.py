@@ -28,7 +28,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / '.env')
 import line_media as fall  # noqa: E402
 
-APP_VERSION = 'fall-follow-2026-11-25-status-fix'
+APP_VERSION = 'fall-follow-2026-11-25-tof-stable'
 
 # --- 硬體 / 網路 ---
 CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
@@ -64,6 +64,8 @@ CENTER_DEADZONE = float(os.getenv('CENTER_DEADZONE', '0.12'))
 UWB_STALE_SECONDS = float(os.getenv('UWB_STALE_SECONDS', '1.0'))
 TOF_STALE_SECONDS = float(os.getenv('TOF_STALE_SECONDS', '1.0'))
 CMD_INTERVAL_SECONDS = float(os.getenv('CMD_INTERVAL_SECONDS', '0.15'))
+# 相同命令心跳（尤其 S）：拉長以免 SoftSerial 洗版干擾 VL53 I2C
+CMD_HEARTBEAT_SECONDS = float(os.getenv('CMD_HEARTBEAT_SECONDS', '0.8'))
 FRAME_WIDTH = int(os.getenv('FRAME_WIDTH', str(fall.FRAME_WIDTH)))
 FRAME_HEIGHT = int(os.getenv('FRAME_HEIGHT', str(fall.FRAME_HEIGHT)))
 YOLO_IMGSZ = int(os.getenv('YOLO_IMGSZ', '320'))
@@ -363,12 +365,15 @@ class MotorCommander:
   def send(self, cmd: str, force: bool = False) -> None:
     cmd = (cmd or 'S').upper()[:1]
     now = time.time()
-    if (
-        not force
-        and cmd == self._last_sent
-        and (now - self._last_sent_at) < CMD_INTERVAL_SECONDS
-    ):
-      return
+    # 相同命令：一般節流；S/X 心跳再拉長，減少 UNO SoftSerial 打斷 I2C
+    if not force and cmd == self._last_sent:
+      gap = (
+          CMD_HEARTBEAT_SECONDS
+          if cmd in {'S', 'X'}
+          else CMD_INTERVAL_SECONDS
+      )
+      if (now - self._last_sent_at) < gap:
+        return
 
     if self._shared_uwb is not None:
       if self._shared_uwb.write_cmd(cmd):
@@ -1061,7 +1066,8 @@ def control_loop() -> None:
           status = f'{status} | {gnote}'
         cmd = guarded
 
-      motor.send(cmd, force=True)
+      # 勿 force：避免每圈狂送 S 干擾 UNO 讀 VL53
+      motor.send(cmd, force=(cmd == 'X'))
       with state_lock:
         latest_cmd = cmd
         latest_status = status
@@ -1069,7 +1075,7 @@ def control_loop() -> None:
         was_forward = next_forward
         fall_status = 'fall: need camera'
       _publish_jpeg(_placeholder_frame('NO CAMERA — UWB/ToF only'))
-      time.sleep(0.15)
+      time.sleep(0.2)
       continue
 
     ok, frame = cap.read()
