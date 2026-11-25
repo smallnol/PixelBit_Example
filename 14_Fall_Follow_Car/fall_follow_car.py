@@ -27,7 +27,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / '.env')
 import line_media as fall  # noqa: E402
 
-APP_VERSION = 'fall-follow-2026-11-25-vl53-front'
+APP_VERSION = 'fall-follow-2026-11-25-ui-clean'
 
 # --- 硬體 / 網路 ---
 CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
@@ -850,10 +850,9 @@ def draw_people(
     is_tgt = target is not None and p is target
     if is_tgt:
       cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
-      label = f'TARGET LOCKED [ID:{tid if tid is not None else "?"}]'
       cv2.putText(
-          frame, label, (x1, max(18, y1 - 8)),
-          cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA,
+          frame, '已鎖定', (x1, max(22, y1 - 10)),
+          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA,
       )
       # 畫鎖定目標骨架
       kpts = p['kpts']
@@ -878,24 +877,14 @@ def draw_people(
                 2,
             )
     else:
-      cv2.rectangle(frame, (x1, y1), (x2, y2), (120, 120, 120), 1)
-      cv2.putText(
-          frame,
-          f'IGNORED[ID:{tid if tid is not None else "?"}]',
-          (x1, max(18, y1 - 6)),
-          cv2.FONT_HERSHEY_SIMPLEX,
-          0.45,
-          (160, 160, 160),
-          1,
-          cv2.LINE_AA,
-      )
+      cv2.rectangle(frame, (x1, y1), (x2, y2), (100, 100, 100), 1)
   if locked_id is not None and target is None:
     cv2.putText(
         frame,
-        f'TARGET ID:{locked_id} LOST - searching',
-        (10, FRAME_HEIGHT - 16),
+        '尋找目標中…',
+        (12, FRAME_HEIGHT - 18),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
+        0.7,
         (0, 165, 255),
         2,
         cv2.LINE_AA,
@@ -917,38 +906,34 @@ def draw_hud(
     lock_txt: str,
     tof_mm: int = 8190,
 ):
+  """畫面只留置中導線與精簡狀態列（詳細狀態改由網頁顯示）。"""
+  del has_person, offset, distance, dist_age, status, fall_txt, lock_txt, tof_mm
   h, w = frame.shape[:2]
   cx = w // 2
   half = int(CENTER_DEADZONE * (w / 2))
 
-  cv2.line(frame, (cx - half, 0), (cx - half, h), (80, 80, 80), 1)
-  cv2.line(frame, (cx + half, 0), (cx + half, h), (80, 80, 80), 1)
-  cv2.line(frame, (cx, 0), (cx, h), (0, 255, 255), 1)
+  cv2.line(frame, (cx - half, 0), (cx - half, h), (70, 70, 70), 1)
+  cv2.line(frame, (cx + half, 0), (cx + half, h), (70, 70, 70), 1)
+  cv2.line(frame, (cx, 0), (cx, h), (0, 220, 255), 1)
 
-  dist_txt = 'UWB: --'
-  if distance is not None:
-    stale = ' (stale)' if dist_age > UWB_STALE_SECONDS else ''
-    dist_txt = f'UWB: {distance:.2f}m{stale}'
+  follow_zh = '跟隨中' if following else '待機'
+  fall_zh = '跌倒偵測' if detecting else ''
+  cmd_map = {'F': '前進', 'L': '左轉', 'R': '右轉', 'Z': '搜尋', 'S': '停止', 'X': '急停'}
+  cmd_zh = cmd_map.get(cmd, cmd)
+  parts = [follow_zh]
+  if fall_zh:
+    parts.append(fall_zh)
+  parts.append(cmd_zh)
+  label = '  ·  '.join(parts)
 
-  lines = [
-      f'FOLLOW: {"ON" if following else "OFF"}  FALL: {"ON" if detecting else "OFF"}  CMD: {cmd}',
-      dist_txt,
-      f'ToF front: {tof_mm} mm',
-      lock_txt[:52],
-      f'offset: {offset:+.2f}' if has_person else 'target: none',
-      status[:52],
-      fall_txt[:52],
-  ]
-  bar_h = 18 + 20 * len(lines)
+  bar_h = 36
   overlay = frame.copy()
-  cv2.rectangle(overlay, (0, 0), (w, bar_h), (0, 0, 0), -1)
-  cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
-  y = 22
-  for line in lines:
-    cv2.putText(
-        frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA
-    )
-    y += 20
+  cv2.rectangle(overlay, (0, h - bar_h), (w, h), (0, 0, 0), -1)
+  cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
+  cv2.putText(
+      frame, label, (12, h - 12),
+      cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA,
+  )
   return frame
 
 
@@ -1186,72 +1171,126 @@ INDEX_HTML = """
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>跌倒偵測 + 跟隨小車</title>
+  <title>陪伴小車控制台</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet"/>
   <style>
     :root {
-      --bg: #0f1419; --panel: #1a222c; --text: #e8eef4; --muted: #93a4b5;
-      --ok: #1f8f4e; --danger: #c0392b; --warn: #b86b00; --accent: #2d7dd2;
+      --bg0: #0c1218; --bg1: #15202b; --panel: rgba(22, 32, 43, .92);
+      --line: #2a3a4a; --text: #eef3f8; --muted: #8fa3b5;
+      --ok: #2a9d5c; --danger: #d64545; --warn: #c47d12; --accent: #3b82c4;
+      --chip: #1c2a38;
     }
     * { box-sizing: border-box; }
-    body { margin: 0; font-family: "Segoe UI", "Noto Sans TC", sans-serif;
-           background: linear-gradient(160deg, #0f1419, #182230 50%, #12181f); color: var(--text); }
-    main { max-width: 1100px; margin: 0 auto; padding: 16px; }
-    h1 { font-size: 1.3rem; margin: 0 0 4px; }
-    .sub { color: var(--muted); font-size: .9rem; margin-bottom: 14px; }
-    .banner {
-      display: none; background: #8b0000; color: #fff; padding: 12px 14px;
-      border-radius: 10px; margin-bottom: 12px; font-weight: 700;
-      animation: pulse 1.2s ease-in-out infinite;
+    body {
+      margin: 0; min-height: 100vh; color: var(--text);
+      font-family: "Noto Sans TC", "Segoe UI", sans-serif;
+      background:
+        radial-gradient(900px 420px at 12% -10%, rgba(59,130,196,.22), transparent 60%),
+        radial-gradient(700px 380px at 100% 0%, rgba(42,157,92,.12), transparent 55%),
+        linear-gradient(165deg, var(--bg0), var(--bg1) 55%, #101820);
     }
-    .banner.show { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
-    @keyframes pulse { 50% { filter: brightness(1.15); } }
-    .grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 14px; }
-    @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+    main { max-width: 1120px; margin: 0 auto; padding: 20px 16px 28px; }
+    .top {
+      display: flex; align-items: flex-end; justify-content: space-between;
+      gap: 12px; flex-wrap: wrap; margin-bottom: 16px;
+    }
+    .brand h1 { margin: 0; font-size: 1.55rem; font-weight: 700; letter-spacing: .02em; }
+    .brand p { margin: 6px 0 0; color: var(--muted); font-size: .92rem; }
+    .live-pills { display: flex; gap: 8px; flex-wrap: wrap; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 8px 12px; border-radius: 999px; background: var(--chip);
+      border: 1px solid var(--line); font-size: .85rem;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #667; }
+    .pill.on .dot { background: var(--ok); box-shadow: 0 0 0 3px rgba(42,157,92,.25); }
+    .pill.warn .dot { background: var(--warn); }
+    .banner {
+      display: none; background: linear-gradient(90deg, #8b1a1a, #b91c1c);
+      color: #fff; padding: 12px 14px; border-radius: 14px; margin-bottom: 14px;
+      font-weight: 700; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+    }
+    .banner.show { display: flex; }
+    .grid { display: grid; grid-template-columns: 1.55fr .95fr; gap: 14px; }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
     .card {
-      background: var(--panel); border: 1px solid #2a3542; border-radius: 12px; padding: 12px;
+      background: var(--panel); border: 1px solid var(--line);
+      border-radius: 18px; padding: 14px; backdrop-filter: blur(8px);
+    }
+    .card h2 {
+      margin: 0 0 10px; font-size: .95rem; font-weight: 500; color: var(--muted);
+      letter-spacing: .04em;
     }
     .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
     button {
-      border: 0; border-radius: 8px; padding: 10px 12px; font-size: .95rem; cursor: pointer; color: #fff;
+      border: 0; border-radius: 12px; padding: 11px 14px; font-size: .92rem;
+      cursor: pointer; color: #fff; font-family: inherit; font-weight: 500;
+      transition: transform .12s ease, filter .12s ease;
     }
-    button:disabled { opacity: .4; cursor: not-allowed; }
+    button:hover { filter: brightness(1.08); }
+    button:active { transform: scale(.98); }
+    button:disabled { opacity: .38; cursor: not-allowed; filter: none; }
     .on { background: var(--ok); }
     .off { background: var(--danger); }
     .warn { background: var(--warn); }
     .ghost { background: #334155; }
     .accent { background: var(--accent); }
-    img.feed { width: 100%; background: #000; border-radius: 8px; display: block; }
-    .pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; max-width: 240px; }
+    .feed-wrap {
+      position: relative; border-radius: 14px; overflow: hidden;
+      border: 1px solid var(--line); background: #000; aspect-ratio: 4/3;
+    }
+    .feed-wrap img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .status-grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px;
+    }
+    .stat {
+      background: #121a22; border: 1px solid var(--line); border-radius: 14px; padding: 12px;
+    }
+    .stat .k { font-size: .78rem; color: var(--muted); margin-bottom: 4px; }
+    .stat .v { font-size: 1.05rem; font-weight: 700; }
+    .stat .v.muted { color: var(--muted); font-weight: 500; font-size: .95rem; }
+    .msg {
+      margin-top: 10px; padding: 12px 14px; border-radius: 14px;
+      background: #121a22; border: 1px solid var(--line); color: #d7e4ef;
+      font-size: .92rem; line-height: 1.5; min-height: 3.2em;
+    }
+    .aside { display: flex; flex-direction: column; gap: 12px; }
+    .pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; max-width: 260px; }
     .pad .spacer { visibility: hidden; }
-    .tof-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
-    .tof {
-      background: #111820; border-radius: 8px; padding: 8px 6px; text-align: center; border: 1px solid #2a3542;
+    .metric-big {
+      font-size: 2rem; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: .02em;
     }
-    .tof.danger { border-color: #e74c3c; background: #3a1515; color: #ffb4b4; }
-    .tof .v { font-size: 1.05rem; font-weight: 700; font-variant-numeric: tabular-nums; }
-    .tof .l { font-size: .75rem; color: var(--muted); }
+    .metric-sub { margin-top: 4px; color: var(--muted); font-size: .85rem; }
     .meter {
-      height: 8px; background: #243040; border-radius: 99px; overflow: hidden; margin-top: 6px;
+      height: 8px; background: #243040; border-radius: 99px; overflow: hidden; margin-top: 10px;
     }
-    .meter > span { display: block; height: 100%; background: #3cb371; }
-    .tof.danger .meter > span { background: #e74c3c; }
-    #status {
-      margin-top: 8px; padding: 10px; background: #111820; border-radius: 8px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap;
-      font-size: .85rem; line-height: 1.45; color: #d7e2ec;
-    }
-    .hint { opacity: .75; font-size: .85rem; margin-top: 10px; }
-    h2 { font-size: 1rem; margin: 0 0 8px; }
+    .meter > span { display: block; height: 100%; background: #3cb371; width: 0%; transition: width .25s ease; }
+    .meter.danger > span { background: #e74c3c; }
+    details.hint { margin-top: 14px; color: var(--muted); font-size: .8rem; opacity: .9; }
+    details.hint summary { cursor: pointer; }
+    details.hint p { margin: 8px 0 0; line-height: 1.5; }
   </style>
 </head>
 <body>
   <main>
     <div id="alertBanner" class="banner">
       <span id="alertText">已確認跌倒！</span>
-      <button class="ghost" onclick="api('/api/clear_alert','POST')">解除警報狀態</button>
+      <button class="ghost" onclick="api('/api/clear_alert','POST')">解除警報</button>
     </div>
-    <h1>跌倒偵測 + 視覺跟隨（鎖定目標版）</h1>
-    <p class="sub">version {{ version }}｜UWB + 1×VL53 正前｜ByteTrack 特定人鎖定</p>
+
+    <div class="top">
+      <div class="brand">
+        <h1>陪伴小車</h1>
+        <p>跌倒偵測 · 視覺跟隨 · 正前避障</p>
+      </div>
+      <div class="live-pills">
+        <div class="pill" id="pillFollow"><span class="dot"></span><span>跟隨關閉</span></div>
+        <div class="pill" id="pillFall"><span class="dot"></span><span>跌倒關閉</span></div>
+        <div class="pill" id="pillLock"><span class="dot"></span><span>尚未鎖定</span></div>
+      </div>
+    </div>
 
     <div class="grid">
       <section class="card">
@@ -1262,17 +1301,25 @@ INDEX_HTML = """
           <button class="off" onclick="api('/stop_detection')">關閉跌倒偵測</button>
         </div>
         <div class="row">
-          <button class="accent" onclick="api('/api/lock_center','POST')">鎖定畫面中央目標</button>
-          <button class="ghost" onclick="api('/api/unlock_target','POST')">解除目標鎖定</button>
+          <button class="accent" onclick="api('/api/lock_center','POST')">鎖定畫面中央</button>
+          <button class="ghost" onclick="api('/api/unlock_target','POST')">解除鎖定</button>
         </div>
-        <img class="feed" src="/video_feed" alt="camera"/>
-        <div id="status">載入中…</div>
+        <div class="feed-wrap">
+          <img src="/video_feed" alt="即時畫面"/>
+        </div>
+        <div class="status-grid">
+          <div class="stat"><div class="k">目前動作</div><div class="v" id="statCmd">停止</div></div>
+          <div class="stat"><div class="k">跌倒狀態</div><div class="v" id="statFall">關閉</div></div>
+          <div class="stat"><div class="k">目標</div><div class="v" id="statTarget">未鎖定</div></div>
+          <div class="stat"><div class="k">連線</div><div class="v muted" id="statLink">檢查中…</div></div>
+        </div>
+        <div class="msg" id="statusMsg">準備就緒</div>
       </section>
 
-      <aside>
-        <section class="card" style="margin-bottom:12px">
+      <aside class="aside">
+        <section class="card">
           <h2>手動遙控</h2>
-          <p class="sub" style="margin:0 0 8px">跟隨 ON 時方向鍵停用；緊急煞停永遠可用</p>
+          <p class="metric-sub" style="margin:0 0 10px">跟隨開啟時方向鍵停用；緊急煞停永遠可用</p>
           <div class="pad">
             <span class="spacer"></span>
             <button id="btnF" class="on" onmousedown="hold('F')" onmouseup="releaseHold()" ontouchstart="hold('F')" ontouchend="releaseHold()">前進</button>
@@ -1286,46 +1333,34 @@ INDEX_HTML = """
           </div>
         </section>
 
-        <section class="card" style="margin-bottom:12px">
-          <h2>UWB 距離</h2>
-          <div id="uwbBox">-- m</div>
-          <div class="sub" id="uwbAge">freshness: --</div>
+        <section class="card">
+          <h2>距離（UWB）</h2>
+          <div class="metric-big" id="uwbBox">--</div>
+          <div class="metric-sub" id="uwbAge">尚無資料</div>
         </section>
 
         <section class="card">
-          <h2>VL53L0X 正前（mm）</h2>
-          <div class="tof-grid" style="grid-template-columns:1fr" id="tofGrid"></div>
-          <div class="sub" id="tofAge" style="margin-top:8px">ToF age: --</div>
+          <h2>正前障礙（VL53）</h2>
+          <div class="metric-big" id="tofVal">--</div>
+          <div class="metric-sub" id="tofAge">單位 mm</div>
+          <div class="meter" id="tofMeter"><span id="tofBar"></span></div>
         </section>
       </aside>
     </div>
 
-    <p class="hint">
-      置中死區 ±{{ deadzone }}｜前進 ≥ {{ start }}m｜停止 &lt; {{ stop }}m｜跌倒確認 {{ confirm }}s｜靈敏度 {{ sens }}｜正前避障 {{ avoid }}mm<br/>
-      UWB/Motor: {{ uwb }}｜手勢鎖定: {{ gesture }}｜{{ version }}
-    </p>
+    <details class="hint">
+      <summary>進階參數</summary>
+      <p>
+        置中死區 ±{{ deadzone }} · 前進 ≥ {{ start }}m · 停止 &lt; {{ stop }}m ·
+        跌倒確認 {{ confirm }}s · 正前避障 {{ avoid }}mm · {{ version }}
+      </p>
+    </details>
   </main>
   <script>
     const AVOID = {{ avoid }};
+    const CMD_ZH = {F:'前進', L:'左轉', R:'右轉', Z:'搜尋中', S:'停止', X:'緊急煞停'};
     let holdTimer = null;
     let following = false;
-
-    function renderTof(val, age) {
-      const root = document.getElementById('tofGrid');
-      if (!root) return;
-      const v = (val === null || val === undefined) ? 8190 : Number(val);
-      const danger = v < AVOID;
-      const pct = Math.max(0, Math.min(100, (v / 1000) * 100));
-      root.innerHTML = '<div class="tof' + (danger ? ' danger' : '') + '">' +
-        '<div class="l">正前</div><div class="v">' + v + '</div>' +
-        '<div class="meter"><span style="width:' + pct + '%"></span></div></div>';
-      const ageEl = document.getElementById('tofAge');
-      if (ageEl) {
-        const a = Number(age);
-        ageEl.textContent = 'ToF age: ' + (Number.isFinite(a) ? a.toFixed(2) : '--') +
-          's' + (a > 1 ? ' (stale)' : '');
-      }
-    }
 
     async function api(path, method='GET', body=null) {
       const opt = { method };
@@ -1336,7 +1371,6 @@ INDEX_HTML = """
       await fetch(path, opt);
       refresh();
     }
-
     async function tap(cmd) {
       await api('/api/manual_cmd', 'POST', {cmd, hold_ms: 200});
     }
@@ -1352,13 +1386,43 @@ INDEX_HTML = """
       if (holdTimer) { clearInterval(holdTimer); holdTimer = null; }
       api('/api/manual_cmd', 'POST', {cmd: 'S', hold_ms: 150});
     }
-
     function setManualEnabled(on) {
       following = on;
       ['btnF','btnL','btnR'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.disabled = on;
       });
+    }
+    function setPill(id, on, text, cls) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.className = 'pill' + (cls ? ' ' + cls : (on ? ' on' : ''));
+      el.querySelector('span:last-child').textContent = text;
+    }
+    function humanFall(j) {
+      if (!j.detecting) return '關閉';
+      if (j.fall_alert_active) return '已確認跌倒';
+      if (j.fall_suspect_elapsed > 0 && j.fall_suspect_elapsed < j.fall_confirm_seconds) {
+        return '疑似跌倒 ' + Number(j.fall_suspect_elapsed).toFixed(1) + 's';
+      }
+      const s = String(j.fall_status || '');
+      if (s.includes('normal')) return '正常';
+      if (s.includes('need TARGET') || s.includes('no locked')) return '需先鎖定';
+      return '偵測中';
+    }
+    function humanMsg(j) {
+      if (j.fall_alert_active) return '已確認跌倒，車輛已緊急煞停。';
+      if (j.search_exhausted) return '搜尋逾時已停止，請再鎖定目標或讓指定人入鏡。';
+      const rec = String(j.recovery || '');
+      if (rec.includes('lost grace')) return '目標暫時消失，稍候重連…';
+      if (rec.includes('search bias')) return '依最後方位搜尋中…';
+      if (rec.includes('search spin')) return '原地搜尋目標中…';
+      if (rec.includes('stuck')) return '疑似卡住，已停止前進。';
+      if (rec.includes('tof: front')) return '正前過近，已停止。';
+      if (!j.locked_target_id) return '請先鎖定畫面中央的人，再開啟跟隨。';
+      if (j.following && j.person_seen) return '正在跟隨鎖定目標。';
+      if (j.following && !j.person_seen) return '跟隨中，但尚未看到鎖定目標。';
+      return '準備就緒。';
     }
 
     async function refresh() {
@@ -1373,64 +1437,51 @@ INDEX_HTML = """
           if (j.fall_alert_active) {
             banner.classList.add('show');
             const at = document.getElementById('alertText');
-            if (at) at.textContent = '已確認跌倒！ ' + (j.fall_alert_ts || '');
-          } else {
-            banner.classList.remove('show');
-          }
+            if (at) at.textContent = '已確認跌倒！';
+          } else banner.classList.remove('show');
         }
+
+        setPill('pillFollow', !!j.following, j.following ? '跟隨中' : '跟隨關閉', j.following ? 'on' : '');
+        setPill('pillFall', !!j.detecting, j.detecting ? '跌倒偵測中' : '跌倒關閉', j.detecting ? 'warn' : '');
+        const locked = j.locked_target_id != null;
+        setPill('pillLock', locked, locked ? ('已鎖定 #' + j.locked_target_id) : '尚未鎖定', locked ? 'on' : '');
+
+        document.getElementById('statCmd').textContent = CMD_ZH[j.cmd] || (j.cmd || '停止');
+        document.getElementById('statFall').textContent = humanFall(j);
+        document.getElementById('statTarget').textContent = locked
+          ? (j.person_seen ? '鎖定目標在畫面中' : '尋找目標中')
+          : '未鎖定';
+        const linkOk = !!j.uwb_ok && !!j.motor_ok;
+        document.getElementById('statLink').textContent = linkOk ? 'UWB / 馬達正常' : '連線異常，請檢查 USB';
+        document.getElementById('statusMsg').textContent = humanMsg(j);
 
         const dist = j.distance;
         const dAge = Number(j.distance_age);
         const uwbStale = dAge > Number(j.uwb_stale_seconds || 1);
-        const uwbBox = document.getElementById('uwbBox');
-        const uwbAge = document.getElementById('uwbAge');
-        if (uwbBox) {
-          uwbBox.textContent = (dist === null || dist === undefined)
-            ? '-- m' : (Number(dist).toFixed(2) + ' m');
-        }
-        if (uwbAge) {
-          uwbAge.textContent = 'freshness: ' +
-            (Number.isFinite(dAge) ? dAge.toFixed(2) : '--') +
-            's (' + (uwbStale ? '逾時 stale' : '正常') + ')';
-        }
+        document.getElementById('uwbBox').textContent =
+          (dist === null || dist === undefined) ? '--' : (Number(dist).toFixed(2) + ' m');
+        document.getElementById('uwbAge').textContent =
+          (!Number.isFinite(dAge) || dAge > 60) ? '尚無資料'
+            : (uwbStale ? '訊號逾時' : '即時');
 
-        renderTof(j.tof_mm, j.tof_age);
-
-        let fallLine = j.fall_status || '';
-        if (j.fall_suspect_elapsed > 0 && j.fall_suspect_elapsed < j.fall_confirm_seconds) {
-          fallLine = '疑似跌倒計時中: ' + Number(j.fall_suspect_elapsed).toFixed(1) +
-            ' / ' + Number(j.fall_confirm_seconds).toFixed(1) + 's';
-        } else if (String(fallLine).startsWith('FALL confirmed')) {
-          fallLine = '已確認跌倒！';
-        } else if (String(fallLine).includes('normal')) {
-          fallLine = '正常';
-        }
-
-        const st = document.getElementById('status');
-        if (st) {
-          st.textContent =
-            '跟隨: ' + (j.following ? 'ON' : 'OFF') + '\\n' +
-            '跌倒偵測: ' + (j.detecting ? 'ON' : 'OFF') + '\\n' +
-            '鎖定: ' + (j.locked_target_id == null ? '未鎖定（等待目標）' : ('已鎖定 ID: ' + j.locked_target_id)) + '\\n' +
-            '命令: ' + (j.cmd || '') + '\\n' +
-            '人體目標: ' + (j.person_seen ? 'yes' : 'no') +
-            '  offset=' + Number(j.offset || 0).toFixed(2) + '\\n' +
-            'UWB: ' + (j.uwb_ok ? 'OK' : 'FAIL') + ' ' + (j.uwb_error || '') + '\\n' +
-            'Motor: ' + (j.motor_ok ? 'OK' : 'FAIL') + ' ' + (j.motor_error || '') + '\\n' +
-            '跟隨狀態: ' + (j.status || '') + '\\n' +
-            '復原: ' + (j.recovery || '-') + '\\n' +
-            '跌倒狀態: ' + fallLine;
-        }
+        const tof = Number(j.tof_mm);
+        const tAge = Number(j.tof_age);
+        const tofShow = Number.isFinite(tof) ? tof : 8190;
+        document.getElementById('tofVal').textContent =
+          (tofShow >= 8000) ? '--' : (tofShow + ' mm');
+        document.getElementById('tofAge').textContent =
+          (!Number.isFinite(tAge) || tAge > 2) ? '訊號逾時或無資料'
+            : (tofShow < AVOID ? '過近，前進會停止' : '安全距離');
+        const meter = document.getElementById('tofMeter');
+        const bar = document.getElementById('tofBar');
+        const pct = Math.max(0, Math.min(100, (tofShow / 1000) * 100));
+        if (bar) bar.style.width = pct + '%';
+        if (meter) meter.className = 'meter' + (tofShow < AVOID ? ' danger' : '');
       } catch (e) {
-        console.error('refresh failed', e);
-        const st = document.getElementById('status');
-        if (st) {
-          st.textContent = '狀態更新失敗: ' + e +
-            '\\n請硬重新整理，或在終端機執行: curl -s http://127.0.0.1:5001/api/status';
-        }
+        console.error(e);
+        document.getElementById('statusMsg').textContent = '無法更新狀態，請重新整理頁面。';
       }
     }
-
     refresh();
     setInterval(refresh, 400);
   </script>
