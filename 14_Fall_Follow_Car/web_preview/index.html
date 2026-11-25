@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>網頁版面預覽｜跌倒偵測 + 跟隨小車</title>
+  <style>
+    :root {
+      --bg: #0f1419; --panel: #1a222c; --text: #e8eef4; --muted: #93a4b5;
+      --ok: #1f8f4e; --danger: #c0392b; --warn: #b86b00; --accent: #2d7dd2;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: "Segoe UI", "Noto Sans TC", sans-serif;
+           background: linear-gradient(160deg, #0f1419, #182230 50%, #12181f); color: var(--text); }
+    main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+    h1 { font-size: 1.3rem; margin: 0 0 4px; }
+    .sub { color: var(--muted); font-size: .9rem; margin-bottom: 14px; }
+    .preview-tag {
+      display: inline-block; background: #5b21b6; color: #fff; font-size: .75rem;
+      padding: 3px 8px; border-radius: 999px; margin-left: 8px; vertical-align: middle;
+    }
+    .banner {
+      display: none; background: #8b0000; color: #fff; padding: 12px 14px;
+      border-radius: 10px; margin-bottom: 12px; font-weight: 700;
+      animation: pulse 1.2s ease-in-out infinite;
+    }
+    .banner.show { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+    @keyframes pulse { 50% { filter: brightness(1.15); } }
+    .grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 14px; }
+    @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--panel); border: 1px solid #2a3542; border-radius: 12px; padding: 12px;
+    }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+    button {
+      border: 0; border-radius: 8px; padding: 10px 12px; font-size: .95rem; cursor: pointer; color: #fff;
+    }
+    button:disabled { opacity: .4; cursor: not-allowed; }
+    .on { background: var(--ok); }
+    .off { background: var(--danger); }
+    .warn { background: var(--warn); }
+    .ghost { background: #334155; }
+    .accent { background: var(--accent); }
+    .feed-wrap {
+      width: 100%; aspect-ratio: 4/3; background: #000; border-radius: 8px; overflow: hidden;
+      position: relative; border: 1px solid #2a3542;
+    }
+    .feed-wrap svg { width: 100%; height: 100%; display: block; }
+    .feed-caption {
+      position: absolute; left: 10px; bottom: 10px; background: rgba(0,0,0,.55);
+      padding: 4px 8px; border-radius: 6px; font-size: .8rem; color: #cde;
+    }
+    .pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; max-width: 240px; }
+    .pad .spacer { visibility: hidden; }
+    .tof-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+    .tof {
+      background: #111820; border-radius: 8px; padding: 8px 6px; text-align: center; border: 1px solid #2a3542;
+    }
+    .tof.danger { border-color: #e74c3c; background: #3a1515; color: #ffb4b4; }
+    .tof .v { font-size: 1.05rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .tof .l { font-size: .75rem; color: var(--muted); }
+    .meter {
+      height: 8px; background: #243040; border-radius: 99px; overflow: hidden; margin-top: 6px;
+    }
+    .meter > span { display: block; height: 100%; background: #3cb371; }
+    .tof.danger .meter > span { background: #e74c3c; }
+    #status {
+      margin-top: 8px; padding: 10px; background: #111820; border-radius: 8px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap;
+      font-size: .85rem; line-height: 1.45; color: #d7e2ec;
+    }
+    .hint { opacity: .75; font-size: .85rem; margin-top: 10px; }
+    h2 { font-size: 1rem; margin: 0 0 8px; }
+    .demo-bar {
+      margin-bottom: 12px; padding: 10px 12px; border: 1px dashed #6d28d9; border-radius: 10px;
+      background: rgba(91, 33, 182, .15);
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="demo-bar">
+      <strong>靜態版面預覽</strong>｜不連樹莓派。按鈕會改下方模擬狀態；相機區為示意圖。<br/>※ VL53／ToF 面板已停用（與實機一致）。
+      <div class="row" style="margin:8px 0 0">
+        <button class="warn" type="button" onclick="demoSuspect()">模擬疑似跌倒</button>
+        <button class="off" type="button" onclick="demoFallAlert()">模擬確認跌倒橫幅</button>
+        <button class="accent" type="button" onclick="demoReset()">重設模擬</button>
+      </div>
+    </div>
+
+    <div id="alertBanner" class="banner">
+      <span id="alertText">已確認跌倒！</span>
+      <button class="ghost" type="button" onclick="clearAlert()">解除警報狀態</button>
+    </div>
+
+    <h1>跌倒偵測 + 視覺跟隨（鎖定目標版）
+      <span class="preview-tag">PREVIEW</span>
+    </h1>
+    <p class="sub">version fall-follow-2026-11-25-no-vl53｜UWB｜ByteTrack 特定人鎖定｜VL53 已停用</p>
+
+    <div class="grid">
+      <section class="card">
+        <div class="row">
+          <button class="on" type="button" onclick="setFollow(true)">開啟跟隨</button>
+          <button class="off" type="button" onclick="setFollow(false)">停止跟隨</button>
+          <button class="warn" type="button" onclick="setDetect(true)">開啟跌倒偵測</button>
+          <button class="off" type="button" onclick="setDetect(false)">關閉跌倒偵測</button>
+        </div>
+        <div class="row">
+          <button class="accent" type="button" onclick="lockTarget()">鎖定畫面中央目標</button>
+          <button class="ghost" type="button" onclick="unlockTarget()">解除目標鎖定</button>
+        </div>
+
+        <div class="feed-wrap" aria-label="camera preview mock">
+          <svg viewBox="0 0 640 480" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stop-color="#1e293b"/>
+                <stop offset="100%" stop-color="#0f172a"/>
+              </linearGradient>
+            </defs>
+            <rect width="640" height="480" fill="url(#g)"/>
+            <!-- deadzone -->
+            <line x1="320" y1="0" x2="320" y2="480" stroke="#facc15" stroke-width="2"/>
+            <line x1="282" y1="0" x2="282" y2="480" stroke="#64748b" stroke-width="1"/>
+            <line x1="358" y1="0" x2="358" y2="480" stroke="#64748b" stroke-width="1"/>
+            <!-- ignored person -->
+            <rect x="80" y="140" width="90" height="220" fill="none" stroke="#9ca3af" stroke-width="2"/>
+            <text x="88" y="132" fill="#9ca3af" font-size="14" font-family="sans-serif">IGNORED[ID:7]</text>
+            <!-- locked target -->
+            <rect id="tgtBox" x="250" y="90" width="140" height="300" fill="none" stroke="#22c55e" stroke-width="4"/>
+            <text id="tgtLabel" x="250" y="78" fill="#22c55e" font-size="16" font-family="sans-serif" font-weight="700">TARGET LOCKED [ID:3]</text>
+            <!-- skeleton-ish -->
+            <circle cx="320" cy="130" r="10" fill="#22c55e"/>
+            <line x1="320" y1="140" x2="320" y2="250" stroke="#22c55e" stroke-width="3"/>
+            <line x1="280" y1="180" x2="360" y2="180" stroke="#22c55e" stroke-width="3"/>
+            <line x1="320" y1="250" x2="290" y2="340" stroke="#22c55e" stroke-width="3"/>
+            <line x1="320" y1="250" x2="350" y2="340" stroke="#22c55e" stroke-width="3"/>
+            <text x="12" y="28" fill="#fff" font-size="14" font-family="monospace">FOLLOW / FALL / CMD mock HUD</text>
+          </svg>
+          <div class="feed-caption">示意畫面（實機為 MJPEG／video_feed）</div>
+        </div>
+
+        <div id="status">載入中…</div>
+      </section>
+
+      <aside>
+        <section class="card" style="margin-bottom:12px">
+          <h2>手動遙控</h2>
+          <p class="sub" style="margin:0 0 8px">跟隨 ON 時方向鍵停用；緊急煞停永遠可用</p>
+          <div class="pad">
+            <span class="spacer"></span>
+            <button id="btnF" class="on" type="button" onmousedown="hold('F')" onmouseup="releaseHold()" ontouchstart="hold('F')" ontouchend="releaseHold()">前進</button>
+            <span class="spacer"></span>
+            <button id="btnL" class="accent" type="button" onmousedown="hold('L')" onmouseup="releaseHold()">左轉</button>
+            <button id="btnS" class="ghost" type="button" onclick="tap('S')">停止</button>
+            <button id="btnR" class="accent" type="button" onmousedown="hold('R')" onmouseup="releaseHold()">右轉</button>
+            <span class="spacer"></span>
+            <button class="off" type="button" onclick="tap('X')">緊急煞停</button>
+            <span class="spacer"></span>
+          </div>
+        </section>
+
+        <section class="card" style="margin-bottom:12px">
+          <h2>UWB 距離</h2>
+          <div id="uwbBox">-- m</div>
+          <div class="sub" id="uwbAge">freshness: --</div>
+        </section>
+      </aside>
+    </div>
+
+    <p class="hint">
+      置中死區 ±0.12｜前進 ≥ 2.0m｜停止 &lt; 1.8m｜跌倒確認 10.0s｜靈敏度 1.45｜VL53 已停用<br/>
+      UWB/Motor: /dev/ttyUSB0｜手勢鎖定: ON｜preview only
+    </p>
+  </main>
+
+  <script>
+    const AVOID = 250;
+    const LABELS = ['左前', '正前', '右前', '正後'];
+    let holdTimer = null;
+
+    // 模擬 /api/status
+    const mock = {
+      following: false,
+      detecting: false,
+      cmd: 'S',
+      status: 'follow OFF (preview)',
+      fall_status: 'fall OFF',
+      fall_suspect_elapsed: 0,
+      fall_confirm_seconds: 10,
+      fall_alert_active: false,
+      fall_alert_ts: '',
+      distance: 2.15,
+      distance_age: 0.12,
+      uwb_stale_seconds: 1.0,
+      person_seen: true,
+      offset: 0.04,
+      locked_target_id: 3,
+      uwb_ok: true,
+      uwb_error: '',
+      motor_ok: true,
+      motor_error: '',
+    };
+
+    function setManualEnabled(on) {
+      ['btnF', 'btnL', 'btnR'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.disabled = on;
+      });
+    }
+
+    function refresh() {
+      setManualEnabled(!!mock.following);
+
+      const banner = document.getElementById('alertBanner');
+      if (mock.fall_alert_active) {
+        banner.classList.add('show');
+        document.getElementById('alertText').textContent =
+          `已確認跌倒！ ${mock.fall_alert_ts || ''}`;
+      } else {
+        banner.classList.remove('show');
+      }
+
+      const uwbStale = mock.distance_age > mock.uwb_stale_seconds;
+      document.getElementById('uwbBox').textContent =
+        mock.distance == null ? '-- m' : `${mock.distance.toFixed(2)} m`;
+      document.getElementById('uwbAge').textContent =
+        `freshness: ${mock.distance_age.toFixed(2)}s (${uwbStale ? '逾時 stale' : '正常'})`;
+
+
+      let fallLine = mock.fall_status;
+      if (mock.fall_suspect_elapsed > 0 && mock.fall_suspect_elapsed < mock.fall_confirm_seconds) {
+        fallLine = `疑似跌倒計時中: ${mock.fall_suspect_elapsed.toFixed(1)} / ${mock.fall_confirm_seconds.toFixed(1)}s`;
+      } else if ((mock.fall_status || '').startsWith('FALL confirmed')) {
+        fallLine = '已確認跌倒！';
+      } else if ((mock.fall_status || '').includes('normal')) {
+        fallLine = '正常';
+      } else if (!mock.detecting) {
+        fallLine = '關閉';
+      }
+
+      document.getElementById('status').textContent =
+        `跟隨: ${mock.following ? 'ON' : 'OFF'}\n` +
+        `跌倒偵測: ${mock.detecting ? 'ON' : 'OFF'}\n` +
+        `鎖定: ${mock.locked_target_id == null ? '未鎖定（等待目標）' : '已鎖定 ID: ' + mock.locked_target_id}\n` +
+        `命令: ${mock.cmd}\n` +
+        `人體目標: ${mock.person_seen ? 'yes' : 'no'}  offset=${mock.offset.toFixed(2)}\n` +
+        `UWB: ${mock.uwb_ok ? 'OK' : 'FAIL'} ${mock.uwb_error || ''}\n` +
+        `Motor: ${mock.motor_ok ? 'OK' : 'FAIL'} ${mock.motor_error || ''}\n` +
+        `跟隨狀態: ${mock.status}\n` +
+        `跌倒狀態: ${fallLine}`;
+
+      // 示意框：有鎖定才顯示綠框標籤
+      const label = document.getElementById('tgtLabel');
+      const box = document.getElementById('tgtBox');
+      if (mock.locked_target_id == null) {
+        label.textContent = 'NO TARGET LOCK';
+        label.setAttribute('fill', '#f59e0b');
+        box.setAttribute('stroke', '#f59e0b');
+      } else {
+        label.textContent = `TARGET LOCKED [ID:${mock.locked_target_id}]`;
+        label.setAttribute('fill', '#22c55e');
+        box.setAttribute('stroke', '#22c55e');
+      }
+    }
+
+    function setFollow(on) {
+      mock.following = on;
+      mock.status = on ? 'centered dist 2.15m -> forward' : 'follow OFF (preview)';
+      mock.cmd = on ? 'F' : 'S';
+      refresh();
+    }
+    function setDetect(on) {
+      mock.detecting = on;
+      if (!on) {
+        mock.fall_status = 'fall OFF';
+        mock.fall_suspect_elapsed = 0;
+      } else if (mock.fall_suspect_elapsed === 0 && !mock.fall_alert_active) {
+        mock.fall_status = 'fall: normal pose';
+      }
+      refresh();
+    }
+    function lockTarget() {
+      mock.locked_target_id = 3;
+      mock.person_seen = true;
+      refresh();
+    }
+    function unlockTarget() {
+      mock.locked_target_id = null;
+      refresh();
+    }
+    function tap(cmd) {
+      if (mock.following && cmd !== 'X' && cmd !== 'S') {
+        mock.status = 'follow ON: manual steer disabled';
+        refresh();
+        return;
+      }
+      mock.cmd = cmd;
+      mock.status = `manual ${cmd}`;
+      refresh();
+    }
+    function hold(cmd) {
+      if (mock.following && cmd !== 'X') return;
+      tap(cmd);
+      if (holdTimer) clearInterval(holdTimer);
+      holdTimer = setInterval(() => tap(cmd), 250);
+    }
+    function releaseHold() {
+      if (holdTimer) { clearInterval(holdTimer); holdTimer = null; }
+      tap('S');
+    }
+    function clearAlert() {
+      mock.fall_alert_active = false;
+      mock.fall_alert_ts = '';
+      mock.fall_status = mock.detecting ? 'fall: normal pose' : 'fall OFF';
+      mock.fall_suspect_elapsed = 0;
+      refresh();
+    }
+    function demoSuspect() {
+      mock.detecting = true;
+      mock.fall_suspect_elapsed = 4.2;
+      mock.fall_status = 'fall suspect 4.2s';
+      mock.fall_alert_active = false;
+      refresh();
+    }
+    function demoFallAlert() {
+      mock.detecting = true;
+      mock.following = false;
+      mock.cmd = 'X';
+      mock.fall_suspect_elapsed = 10.1;
+      mock.fall_status = 'FALL confirmed 10.1s';
+      mock.fall_alert_active = true;
+      mock.fall_alert_ts = new Date().toLocaleString();
+      mock.status = 'FALL confirmed -> E-STOP';
+      refresh();
+    }
+    function demoNearObstacle() {
+      refresh();
+    }
+    function demoReset() {
+      mock.following = false;
+      mock.detecting = false;
+      mock.cmd = 'S';
+      mock.status = 'follow OFF (preview)';
+      mock.fall_status = 'fall OFF';
+      mock.fall_suspect_elapsed = 0;
+      mock.fall_alert_active = false;
+      mock.fall_alert_ts = '';
+      mock.distance = 2.15;
+      mock.distance_age = 0.12;
+      mock.locked_target_id = 3;
+      mock.person_seen = true;
+      mock.offset = 0.04;
+      refresh();
+    }
+
+    refresh();
+    // 輕微抖動模擬「即時更新」
+    setInterval(() => {
+      mock.distance_age = Math.max(0.05, mock.distance_age + (Math.random() - 0.45) * 0.05);
+      if (!mock.fall_alert_active && mock.fall_suspect_elapsed === 0) {
+        mock.distance = 2.0 + Math.random() * 0.4;
+      }
+      refresh();
+    }, 800);
+  </script>
+</body>
+</html>
