@@ -1,8 +1,12 @@
 # 部署手冊：接線／供電／燒錄／樹莓派指令
 
-分支：`cursor/fall-follow-vl53-lock-dash-1509`  
+分支：`cursor/remove-vl53-1509`（基底可對 `cursor/fall-follow-combine-1509`）  
 目錄：`14_Fall_Follow_Car/`  
-雷射：**4× VL53L0X**（左前、正前、右前、**正後**）
+
+> **※ 2026-11-25 註解：VL53L0X 已全部拔除。**  
+> - 不燒 `uno_car_vl53`；改燒 **`firmware/uno_car/uno_car.ino`**  
+> - 無 `O:` 遙測、網頁無 ToF、無近距避障覆寫  
+> - 舊 VL53 接線表保留於下方「附錄」僅供日後復用  
 
 完整功能＋腳位總表見 **`FEATURES_PINOUT.txt`**。
 
@@ -12,14 +16,14 @@
 
 | 板子 | 燒錄檔案 | 說明 |
 |------|----------|------|
-| **車上 ESP32-UWB** | `firmware/uwb_car_responder/uwb_car_responder.ino` | 測距 `D:`；USB↔Pi；轉發馬達命令；橋接 `O:` |
-| **Arduino UNO** | `firmware/uno_car_vl53/uno_car_vl53.ino` | 馬達、4×VL53 避障、回傳 `O:` |
-| **身上 Tag ESP32** | `uwb-follow-car` → `uwb_tag_initiator`（**沿用即可，不必因 VL53 重燒**） | 人身上測距標籤；與車上 Anchor 訊息格式已對齊 |
+| **車上 ESP32-UWB** | `firmware/uwb_car_responder/uwb_car_responder.ino` | 測距 `D:`；USB↔Pi；轉發馬達命令（**不轉 O:**） |
+| **Arduino UNO** | `firmware/uno_car/uno_car.ino` | **純馬達**；執行 F/L/R/Z/S/X |
+| **身上 Tag ESP32** | `uwb-follow-car` → `uwb_tag_initiator`（沿用） | 人身上測距標籤 |
 | **樹莓派 5** | **不燒 .ino** | 跑 `fall_follow_car.py` + `line_media.py` |
 
 ### Arduino IDE 函式庫
 
-- UNO：`BMP73T104`、**VL53L0X（Pololu）**
+- UNO：`BMP73T104`（**不需** Pololu VL53L0X）
 - 車上 ESP32：`dw3000`（與原本 UWB 專案相同）
 
 ---
@@ -60,13 +64,11 @@
                               樹莓派 5 + USB 相機
                                    │
               GPIO17 ──────────────┘──► UNO D10   （命令 F/L/R/Z/S/X）
-              GPIO16 ◄──────────────── UNO D11   （O: 四顆距離）
+              GPIO16 ◄──────────────── UNO D11   （保留；目前不送 O:）
               GND 共地
 
 UNO + BMP73T104（插上擴充板）
-  │ I2C SDA/SCL + XSHUT
-  ▼
-4× VL53L0X
+  ※ VL53 本輪可不接
 ```
 
 ### 3.2 ESP32 ↔ UNO
@@ -74,38 +76,25 @@ UNO + BMP73T104（插上擴充板）
 | 從 | 到 | 用途 |
 |----|----|------|
 | ESP32 **GPIO17** | UNO **D10** | 馬達命令 |
-| UNO **D11** | ESP32 **GPIO16** | `O:` 回傳（必接） |
+| UNO **D11** | ESP32 **GPIO16** | 保留（VL53 停用期間可留線） |
 | ESP32 **GND** | UNO **GND** | 共地 |
 | ESP32 **USB** | 樹莓派 **USB** | `/dev/ttyUSB0` |
 
-> 板子上數字腳就是 `2`～`5`，不一定印 `D`。
+### 3.3 協定字串（目前）
 
-### 3.3 四顆 VL53L0X（接在 UNO）
+- Pi → ESP32 → UNO：`F` / `L` / `R` / `Z` / `S` / `X` + 換行  
+- ESP32 → Pi：`D:1.85`（UWB 公尺）  
+- ~~UNO → ESP32 → Pi：`O:...`~~ **已停用**
 
-共用：**SDA、SCL、VCC（建議 UNO 5V）、GND**；每顆一根 **XSHUT**：
-
-| 編號 | 方位 | 朝向 | UNO XSHUT | I2C 位址 | 用途 |
-|------|------|------|-----------|----------|------|
-| [0] | **左前** | 水平朝前偏左 | **2** | `0x30` | 前進避障 |
-| [1] | **正前** | 水平朝前 | **3** | `0x31` | 前進避障 |
-| [2] | **右前** | 水平朝前偏右 | **4** | `0x32` | 前進避障 |
-| [3] | **正後** | 水平朝後 | **5** | `0x33` | 自轉時後方過近則停 |
-
-開機：四根 XSHUT 先全 LOW → 依序拉高並改址，避免都搶預設 `0x29`。
-
-### 3.4 避障行為（UNO 底層）
+### 3.4 行為（無 VL53）
 
 | 情況 | 行為 |
 |------|------|
-| 收到 `F`，左前／正前／右前任一 **&lt; 250mm** | 強制停或往較空側微轉 |
-| **正後 &lt; 250mm** 且命令為自轉 `Z` | **強制 `S`** |
-| 收到 `X` | 急停，不被覆寫 |
+| 收到 `F/L/R/Z/S` | UNO 原樣執行（**無避障覆寫**） |
+| 收到 `X` | 急停 |
+| 命令逾時 | 自動停 |
 
-### 3.5 協定字串
-
-- Pi → ESP32 → UNO：`F` / `L` / `R` / `Z` / `S` / `X` + 換行  
-- UNO → ESP32 → Pi：`O:左前,正前,右前,正後`（mm）  
-- ESP32 → Pi：`D:1.85`（UWB 公尺）
+**請人工監看障礙；無雷射近距防護。**
 
 ---
 
@@ -120,13 +109,13 @@ sudo usermod -aG dialout $USER
 mkdir -p ~/fall_follow && cd ~/fall_follow
 
 curl -fsSL -o fall_follow_car.py \
-  "https://raw.githubusercontent.com/smallnol/PixelBit_Example/cursor/fall-follow-vl53-lock-dash-1509/14_Fall_Follow_Car/fall_follow_car.py"
+  "https://raw.githubusercontent.com/smallnol/PixelBit_Example/cursor/remove-vl53-1509/14_Fall_Follow_Car/fall_follow_car.py"
 curl -fsSL -o line_media.py \
-  "https://raw.githubusercontent.com/smallnol/PixelBit_Example/cursor/fall-follow-vl53-lock-dash-1509/14_Fall_Follow_Car/line_media.py"
+  "https://raw.githubusercontent.com/smallnol/PixelBit_Example/cursor/remove-vl53-1509/14_Fall_Follow_Car/line_media.py"
 curl -fsSL -o requirements.txt \
-  "https://raw.githubusercontent.com/smallnol/PixelBit_Example/cursor/fall-follow-vl53-lock-dash-1509/14_Fall_Follow_Car/requirements.txt"
+  "https://raw.githubusercontent.com/smallnol/PixelBit_Example/cursor/remove-vl53-1509/14_Fall_Follow_Car/requirements.txt"
 curl -fsSL -o .env.example \
-  "https://raw.githubusercontent.com/smallnol/PixelBit_Example/cursor/fall-follow-vl53-lock-dash-1509/14_Fall_Follow_Car/.env.example"
+  "https://raw.githubusercontent.com/smallnol/PixelBit_Example/cursor/remove-vl53-1509/14_Fall_Follow_Car/.env.example"
 
 python3 -m venv .venv
 source .venv/bin/activate
@@ -147,7 +136,6 @@ UWB_SERIAL_PORT=/dev/ttyUSB0
 MOTOR_SERIAL_PORT=/dev/ttyUSB0
 CAMERA_INDEX=0
 PORT=5001
-AVOID_MM=250
 FALL_SENSITIVITY=1.45
 ```
 
@@ -166,9 +154,9 @@ cd ~/fall_follow
 source .venv/bin/activate
 
 curl -fsSL -o fall_follow_car.py \
-  "https://raw.githubusercontent.com/smallnol/PixelBit_Example/cursor/fall-follow-vl53-lock-dash-1509/14_Fall_Follow_Car/fall_follow_car.py"
+  "https://raw.githubusercontent.com/smallnol/PixelBit_Example/cursor/remove-vl53-1509/14_Fall_Follow_Car/fall_follow_car.py"
 curl -fsSL -o line_media.py \
-  "https://raw.githubusercontent.com/smallnol/PixelBit_Example/cursor/fall-follow-vl53-lock-dash-1509/14_Fall_Follow_Car/line_media.py"
+  "https://raw.githubusercontent.com/smallnol/PixelBit_Example/cursor/remove-vl53-1509/14_Fall_Follow_Car/line_media.py"
 
 pkill -f fall_follow_car.py || true
 python3 fall_follow_car.py
@@ -192,16 +180,16 @@ ser.close()
 PY
 ```
 
-預期：`D:x.xx`（Tag 開著）以及 `O:a,b,c,d` 四個數字。
+預期：`D:x.xx`（Tag 開著）。**不應再期待 `O:a,b,c,d`。**
 
 ---
 
 ## 五、上電順序（建議）
 
-1. 接好共地、訊號、四顆 VL53  
+1. 接好共地、訊號（**VL53 可不接**）  
 2. 電池 B → 馬達板；電池 A → DC 頭 → XY3606 → USB-C → Pi  
 3. 車上 ESP32 插 Pi USB；身上 Tag 開機  
-4. 確認已燒本文件列出的 UNO／ESP32 韌體  
+4. 確認已燒 **`uno_car.ino`** 與更新後的 `uwb_car_responder.ino`  
 5. Pi 執行 `python3 fall_follow_car.py`  
 6. 網頁先**鎖定目標** → 再開跟隨／跌倒偵測  
 
@@ -211,7 +199,23 @@ PY
 
 | 現象 | 檢查 |
 |------|------|
-| 沒有 `O:` 四個數 | UNO 韌體、D11↔GPIO16、VL53 供電／XSHUT |
+| 沒有 `O:` | **正常**（VL53 已停用） |
 | 沒有 `D:` | Tag 有無開機 |
 | 馬達不轉 | GPIO17→D10、共地、Pi log 是否有 `FWD->UNO` |
 | Pi 無法開機／重開 | XY3606 輸出電壓是否約 5.1V；電流是否夠 |
+| 撞到障礙 | **無近距避障**；請降低速度／人工監看，或日後接回 VL53 |
+
+---
+
+## 附錄｜舊 VL53 接線（已停用，僅供日後復用）
+
+> 以下**目前程式不會使用**。若要復用：燒回 `uno_car_vl53`、恢復 Pi／ESP32 的 `O:` 解析。
+
+| 編號 | 方位 | UNO XSHUT | I2C 位址 |
+|------|------|-----------|----------|
+| [0] | 左前 | D2 | `0x30` |
+| [1] | 正前 | D3 | `0x31` |
+| [2] | 右前 | D4 | `0x32` |
+| [3] | 正後 | D5 | `0x33` |
+
+共用 SDA/SCL/VCC(建議 5V)/GND；門檻舊值約 `AVOID_MM=250`。

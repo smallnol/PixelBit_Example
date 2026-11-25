@@ -80,11 +80,10 @@
 <body>
   <main>
     <div class="demo-bar">
-      <strong>靜態版面預覽</strong>｜不連樹莓派。按鈕會改下方模擬狀態；相機區為示意圖。
+      <strong>靜態版面預覽</strong>｜不連樹莓派。按鈕會改下方模擬狀態；相機區為示意圖。<br/>※ VL53／ToF 面板已停用（與實機一致）。
       <div class="row" style="margin:8px 0 0">
         <button class="warn" type="button" onclick="demoSuspect()">模擬疑似跌倒</button>
         <button class="off" type="button" onclick="demoFallAlert()">模擬確認跌倒橫幅</button>
-        <button class="ghost" type="button" onclick="demoNearObstacle()">模擬前方障礙／落差（ToF 變紅）</button>
         <button class="accent" type="button" onclick="demoReset()">重設模擬</button>
       </div>
     </div>
@@ -97,7 +96,7 @@
     <h1>跌倒偵測 + 視覺跟隨（鎖定目標版）
       <span class="preview-tag">PREVIEW</span>
     </h1>
-    <p class="sub">version fall-follow-2026-11-25-vl53x4-rear｜UWB + 4×VL53L0X｜ByteTrack 特定人鎖定</p>
+    <p class="sub">version fall-follow-2026-11-25-no-vl53｜UWB｜ByteTrack 特定人鎖定｜VL53 已停用</p>
 
     <div class="grid">
       <section class="card">
@@ -167,17 +166,11 @@
           <div id="uwbBox">-- m</div>
           <div class="sub" id="uwbAge">freshness: --</div>
         </section>
-
-        <section class="card">
-          <h2>VL53L0X（mm）左前／正前／右前／正後</h2>
-          <div class="tof-grid" id="tofGrid"></div>
-          <div class="sub" id="tofAge" style="margin-top:8px">ToF age: --</div>
-        </section>
       </aside>
     </div>
 
     <p class="hint">
-      置中死區 ±0.12｜前進 ≥ 2.0m｜停止 &lt; 1.8m｜跌倒確認 10.0s｜靈敏度 1.45｜避障 250mm<br/>
+      置中死區 ±0.12｜前進 ≥ 2.0m｜停止 &lt; 1.8m｜跌倒確認 10.0s｜靈敏度 1.45｜VL53 已停用<br/>
       UWB/Motor: /dev/ttyUSB0｜手勢鎖定: ON｜preview only
     </p>
   </main>
@@ -201,8 +194,6 @@
       distance: 2.15,
       distance_age: 0.12,
       uwb_stale_seconds: 1.0,
-      tof_mm: [620, 780, 640, 900],
-      tof_age: 0.18,
       person_seen: true,
       offset: 0.04,
       locked_target_id: 3,
@@ -217,23 +208,6 @@
         const el = document.getElementById(id);
         if (el) el.disabled = on;
       });
-    }
-
-    function renderTof(vals, age) {
-      const root = document.getElementById('tofGrid');
-      root.innerHTML = '';
-      (vals || []).forEach((v, i) => {
-        const danger = v < AVOID;
-        const pct = Math.max(0, Math.min(100, (v / 1000) * 100));
-        const div = document.createElement('div');
-        div.className = 'tof' + (danger ? ' danger' : '');
-        div.innerHTML = `<div class="l">${LABELS[i]}</div>
-          <div class="v">${v}</div>
-          <div class="meter"><span style="width:${pct}%"></span></div>`;
-        root.appendChild(div);
-      });
-      document.getElementById('tofAge').textContent =
-        `ToF age: ${age.toFixed(2)}s` + (age > 1 ? ' (stale)' : '');
     }
 
     function refresh() {
@@ -254,7 +228,6 @@
       document.getElementById('uwbAge').textContent =
         `freshness: ${mock.distance_age.toFixed(2)}s (${uwbStale ? '逾時 stale' : '正常'})`;
 
-      renderTof(mock.tof_mm, mock.tof_age);
 
       let fallLine = mock.fall_status;
       if (mock.fall_suspect_elapsed > 0 && mock.fall_suspect_elapsed < mock.fall_confirm_seconds) {
@@ -363,8 +336,6 @@
       refresh();
     }
     function demoNearObstacle() {
-      mock.tof_mm = [180, 210, 190, 900];
-      mock.tof_age = 0.1;
       refresh();
     }
     function demoReset() {
@@ -378,8 +349,6 @@
       mock.fall_alert_ts = '';
       mock.distance = 2.15;
       mock.distance_age = 0.12;
-      mock.tof_mm = [620, 780, 640, 900];
-      mock.tof_age = 0.18;
       mock.locked_target_id = 3;
       mock.person_seen = true;
       mock.offset = 0.04;
@@ -390,7 +359,6 @@
     // 輕微抖動模擬「即時更新」
     setInterval(() => {
       mock.distance_age = Math.max(0.05, mock.distance_age + (Math.random() - 0.45) * 0.05);
-      mock.tof_age = Math.max(0.05, 0.1 + Math.random() * 0.15);
       if (!mock.fall_alert_active && mock.fall_suspect_elapsed === 0) {
         mock.distance = 2.0 + Math.random() * 0.4;
       }

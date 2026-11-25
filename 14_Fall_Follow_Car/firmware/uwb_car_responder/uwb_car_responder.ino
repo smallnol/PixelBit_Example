@@ -1,14 +1,16 @@
 /*
- * 車上 ESP32-UWB = DS-TWR Responder + 馬達／避障雙向轉發
+ * 車上 ESP32-UWB = DS-TWR Responder + 馬達命令轉發
+ *
+ * ※ 2026-11-25：VL53／O: 避障遙測已停用；Serial2 RX（GPIO16）保留接線，
+ *   目前不再轉傳 O: 給 Pi。
  *
  * USB（115200，接樹莓派）：
  *   輸出距離：D:1.85
- *   輸出避障：O:320,450,210,580   ← 來自 UNO（左前,正前,右前,正後）
  *   接收馬達：F/L/R/Z/S/X（Pi 寫入同一 USB）
  *
  * Serial2：
  *   TX GPIO17 → UNO D10（轉傳馬達命令）
- *   RX GPIO16 ← UNO D11（接收 O: 避障封包）
+ *   RX GPIO16 ← UNO D11（保留；VL53 停用期間忽略）
  *
  * 需搭配 dw3000 函式庫（與原 uwb-follow-car 相同）。
  */
@@ -107,26 +109,10 @@ void pollUsbMotorCmds() {
   }
 }
 
-// 從 UNO（Serial2 RX）讀 O: 避障封包，原樣轉發到 USB 給 Pi
-void pollUnoTelemetry() {
-  static char buf[64];
-  static uint8_t idx = 0;
-
+// VL53 停用：排空 Serial2 RX，避免緩衝區塞滿（不轉傳 O:）
+void drainSerial2Rx() {
   while (Serial2.available() > 0) {
-    char c = (char)Serial2.read();
-    if (c == '\n' || c == '\r') {
-      if (idx == 0) continue;
-      buf[idx] = '\0';
-      idx = 0;
-      // 只轉傳避障／明確標頭，避免雜訊刷屏
-      if (buf[0] == 'O' || buf[0] == 'o') {
-        Serial.println(buf);
-      }
-    } else if (idx < sizeof(buf) - 1) {
-      buf[idx++] = c;
-    } else {
-      idx = 0;
-    }
+    (void)Serial2.read();
   }
 }
 
@@ -135,8 +121,8 @@ void setup() {
   // RX=16 ← UNO D11；TX=17 → UNO D10
   Serial2.begin(9600, SERIAL_8N1, 16, 17);
   delay(1000);
-  Serial.println(F("--- 車上 Anchor = DS-TWR Responder + O: bridge ---"));
-  Serial.println(F("USB: D:xx.xx | O:mm,... | 收馬達命令轉 Serial2"));
+  Serial.println(F("--- 車上 Anchor = DS-TWR Responder + motor bridge ---"));
+  Serial.println(F("USB: D:xx.xx | 收馬達命令轉 Serial2（VL53/O: 已停用）"));
 
   spiBegin(PIN_IRQ, PIN_RST);
   spiSelect(PIN_SS);
@@ -157,9 +143,8 @@ void setup() {
 }
 
 void loop() {
-  // 優先處理馬達與避障遙測，避免 UWB 忙碌時延遲
   pollUsbMotorCmds();
-  pollUnoTelemetry();
+  drainSerial2Rx();
 
   uint64_t poll_rx_ts, resp_tx_ts, final_rx_ts;
   uint32_t poll_tx_ts, resp_rx_ts, final_tx_ts;
@@ -174,7 +159,7 @@ void loop() {
   while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) &
            (SYS_STATUS_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_ERR))) {
     pollUsbMotorCmds();
-    pollUnoTelemetry();
+    drainSerial2Rx();
     if (millis() - guard > 50) return;
   }
 
@@ -209,7 +194,7 @@ void loop() {
   while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) &
            (SYS_STATUS_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR))) {
     pollUsbMotorCmds();
-    pollUnoTelemetry();
+    drainSerial2Rx();
     if (millis() - guard > 30) break;
   }
 

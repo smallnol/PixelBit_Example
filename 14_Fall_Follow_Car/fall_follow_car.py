@@ -3,14 +3,13 @@
 
 功能：
 1. YOLO-pose + ByteTrack：鎖定特定人跟隨／跌倒（路人不觸發）
-2. ESP32-UWB 距離 + 4×VL53L0X 避障遙測（O:）
+2. ESP32-UWB 距離（VL53／O: 避障已停用，見 DEPLOY.md）
 3. 確認跌倒 → 緊急煞停 X + LINE
-4. 網頁：跟隨／跌倒開關、鎖定目標、手動遙控、感測儀表板
+4. 網頁：跟隨／跌倒開關、鎖定目標、手動遙控、UWB 儀表板
 """
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import threading
@@ -28,7 +27,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / '.env')
 import line_media as fall  # noqa: E402
 
-APP_VERSION = 'fall-follow-2026-11-25-tof-stable'
+APP_VERSION = 'fall-follow-2026-11-25-no-vl53'
 
 # --- 硬體 / 網路 ---
 CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
@@ -62,9 +61,7 @@ START_DIST = float(os.getenv('START_DIST', '2.0'))
 STOP_DIST = float(os.getenv('STOP_DIST', '1.8'))
 CENTER_DEADZONE = float(os.getenv('CENTER_DEADZONE', '0.12'))
 UWB_STALE_SECONDS = float(os.getenv('UWB_STALE_SECONDS', '1.0'))
-TOF_STALE_SECONDS = float(os.getenv('TOF_STALE_SECONDS', '1.0'))
 CMD_INTERVAL_SECONDS = float(os.getenv('CMD_INTERVAL_SECONDS', '0.15'))
-# 相同命令心跳（尤其 S）：拉長以免 SoftSerial 洗版干擾 VL53 I2C
 CMD_HEARTBEAT_SECONDS = float(os.getenv('CMD_HEARTBEAT_SECONDS', '0.8'))
 FRAME_WIDTH = int(os.getenv('FRAME_WIDTH', str(fall.FRAME_WIDTH)))
 FRAME_HEIGHT = int(os.getenv('FRAME_HEIGHT', str(fall.FRAME_HEIGHT)))
@@ -75,26 +72,15 @@ GESTURE_LOCK_SECONDS = float(os.getenv('GESTURE_LOCK_SECONDS', '2.0'))
 HSV_REID_THRESHOLD = float(os.getenv('HSV_REID_THRESHOLD', '0.60'))
 # 目標遺失搜尋中提高 Re-ID 門檻，降低誤跟路人
 HSV_REID_SEARCH = float(os.getenv('HSV_REID_SEARCH', '0.72'))
-AVOID_MM = int(os.getenv('AVOID_MM', '250'))
-SIDE_AVOID_MM = int(os.getenv('SIDE_AVOID_MM', '220'))
-TOF_OPEN_MARGIN = int(os.getenv('TOF_OPEN_MARGIN', '30'))
 LOST_GRACE_SECONDS = float(os.getenv('LOST_GRACE_SECONDS', '1.0'))
 SEARCH_BIAS_SECONDS = float(os.getenv('SEARCH_BIAS_SECONDS', '3.0'))
 Z_TIMEOUT_SECONDS = float(os.getenv('Z_TIMEOUT_SECONDS', '12.0'))
 STUCK_SECONDS = float(os.getenv('STUCK_SECONDS', '4.0'))
 STUCK_DIST_EPS = float(os.getenv('STUCK_DIST_EPS', '0.15'))
-CORRIDOR_NUDGE_MM = int(os.getenv('CORRIDOR_NUDGE_MM', '400'))
-CORRIDOR_BIAS_MM = int(os.getenv('CORRIDOR_BIAS_MM', '80'))
 TRACKER_CFG = os.getenv('TRACKER_CFG', 'bytetrack.yaml').strip() or 'bytetrack.yaml'
 
 DIST_LINE_RE = re.compile(r'D:\s*([0-9]+(?:\.[0-9]+)?)', re.IGNORECASE)
 DIST_LEGACY_RE = re.compile(r'\[CAR\]\s*([0-9]+(?:\.[0-9]+)?)\s*m', re.IGNORECASE)
-# O:左前,正前,右前,正後
-TOF_LINE_RE = re.compile(
-    r'O:\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)',
-    re.IGNORECASE,
-)
-TOF_LABELS = ('左前', '正前', '右前', '正後')
 
 app = Flask(__name__)
 
@@ -110,8 +96,6 @@ fall_alert_active = False
 fall_alert_ts = ''
 latest_distance: float | None = None
 last_distance_time = 0.0
-latest_tof_mm = [8190, 8190, 8190, 8190]
-last_tof_time = 0.0
 latest_cmd = 'S'
 latest_status = '待機'
 person_offset = 0.0
@@ -130,7 +114,7 @@ gesture_raise_since: dict[int, float] = {}
 manual_cmd: str | None = None
 manual_cmd_until = 0.0
 
-# --- 跟隨復原／避障狀態（對應走道、遮擋、轉角等情境）---
+# --- 跟隨復原狀態（無 VL53；靠 UWB + 視覺）---
 last_seen_offset = 0.0
 target_lost_since: float | None = None
 search_spin_since: float | None = None
@@ -154,7 +138,7 @@ if cap.isOpened():
 else:
   print(
       f'⚠️ 相機無法開啟 index={CAMERA_INDEX}：'
-      f'網頁仍顯示 UWB／ToF；跟隨／跌倒需接回鏡頭',
+      f'網頁仍顯示 UWB；跟隨／跌倒需接回鏡頭',
       flush=True,
   )
 
@@ -167,17 +151,11 @@ def _placeholder_frame(msg: str = 'NO CAMERA') -> np.ndarray:
   )
   with state_lock:
     dist = latest_distance
-    tof = list(latest_tof_mm)
     cmd = latest_cmd
   y = 40
   cv2.putText(
       frame, f'UWB: {dist if dist is not None else "--"} m  CMD: {cmd}',
       (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA,
-  )
-  y += 28
-  cv2.putText(
-      frame, 'ToF: ' + ','.join(str(v) for v in tof),
-      (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 255, 200), 1, cv2.LINE_AA,
   )
   return frame
 
@@ -191,7 +169,7 @@ def _publish_jpeg(frame: np.ndarray) -> None:
 
 
 class SerialReader:
-  """背景讀取 UWB 距離與 VL53 O:；可與馬達命令共用同一 USB 口。"""
+  """背景讀取 UWB 距離；可與馬達命令共用同一 USB 口。（VL53/O: 已停用）"""
 
   def __init__(self, port: str, baud: int):
     self.port = port
@@ -252,7 +230,7 @@ class SerialReader:
         return False
 
   def _run(self) -> None:
-    global latest_distance, last_distance_time, latest_tof_mm, last_tof_time
+    global latest_distance, last_distance_time
     while not self._stop.is_set():
       with self._io_lock:
         need_open = self._ser is None or not self._ser.is_open
@@ -273,19 +251,6 @@ class SerialReader:
           continue
         if 'FWD' in line.upper() or line.upper().startswith('CMD'):
           print(f'📥 ESP32: {line}', flush=True)
-
-        m_tof = TOF_LINE_RE.search(line)
-        if m_tof:
-          vals = [int(m_tof.group(i)) for i in range(1, 5)]
-          with state_lock:
-            latest_tof_mm = vals
-            last_tof_time = time.time()
-          if not hasattr(self, '_tof_log_n'):
-            self._tof_log_n = 0
-          self._tof_log_n += 1
-          if self._tof_log_n <= 5 or self._tof_log_n % 25 == 0:
-            print(f'📥 O: {vals}', flush=True)
-          continue
 
         m = DIST_LINE_RE.search(line) or DIST_LEGACY_RE.search(line)
         if not m:
@@ -365,7 +330,7 @@ class MotorCommander:
   def send(self, cmd: str, force: bool = False) -> None:
     cmd = (cmd or 'S').upper()[:1]
     now = time.time()
-    # 相同命令：一般節流；S/X 心跳再拉長，減少 UNO SoftSerial 打斷 I2C
+    # 相同命令：一般節流；S/X 心跳再拉長，減少 SoftSerial 洗版
     if not force and cmd == self._last_sent:
       gap = (
           CMD_HEARTBEAT_SECONDS
@@ -570,71 +535,9 @@ def resolve_locked_target(people: list[dict], frame: np.ndarray) -> tuple[dict |
   return None, f'locked id={locked_target_id} LOST'
 
 
-def _tof_fresh(tof_age: float) -> bool:
-  return tof_age <= TOF_STALE_SECONDS
-
-
-def _front_avoid_cmd(fl: int, ff: int, fr: int) -> str | None:
-  """前方過近時回傳覆寫命令；無須覆寫則 None。"""
-  blocked = (fl < AVOID_MM) or (ff < AVOID_MM) or (fr < AVOID_MM)
-  if not blocked:
-    return None
-  if fl < AVOID_MM and ff < AVOID_MM and fr < AVOID_MM:
-    return 'S'
-  if fl > fr + TOF_OPEN_MARGIN:
-    return 'L'
-  if fr > fl + TOF_OPEN_MARGIN:
-    return 'R'
-  return 'S'
-
-
-def _apply_tof_motion_guard(
-    cmd: str,
-    tof_mm: list[int],
-    tof_age: float,
-) -> tuple[str, str]:
-  """
-  Pi 端 ToF 防護：走道側牆、前方矮障、自轉後方。
-  與 UNO 底層雙保險；不用 AOA。
-  """
-  if cmd in {'S', 'X'} or not _tof_fresh(tof_age) or len(tof_mm) < 4:
-    return cmd, ''
-
-  fl, ff, fr, rear = (int(tof_mm[0]), int(tof_mm[1]), int(tof_mm[2]), int(tof_mm[3]))
-  note = ''
-
-  if cmd == 'Z' and rear < AVOID_MM:
-    return 'S', 'tof: rear blocked stop Z'
-
-  # 禁止往近牆側轉（情境1）
-  if cmd == 'L' and fl < SIDE_AVOID_MM:
-    if fr > fl + TOF_OPEN_MARGIN:
-      return 'R', 'tof: left wall -> bias R'
-    return 'S', 'tof: left wall hold'
-  if cmd == 'R' and fr < SIDE_AVOID_MM:
-    if fl > fr + TOF_OPEN_MARGIN:
-      return 'L', 'tof: right wall -> bias L'
-    return 'S', 'tof: right wall hold'
-
-  if cmd == 'F':
-    avoid = _front_avoid_cmd(fl, ff, fr)
-    if avoid is not None:
-      return avoid, f'tof: front avoid -> {avoid}'
-    # 走道置中微偏：一側明顯較近牆則往另一側靠
-    if fl < CORRIDOR_NUDGE_MM and fl < fr - CORRIDOR_BIAS_MM:
-      return 'R', 'tof: corridor nudge R'
-    if fr < CORRIDOR_NUDGE_MM and fr < fl - CORRIDOR_BIAS_MM:
-      return 'L', 'tof: corridor nudge L'
-
-  return cmd, note
-
-
-def _recover_when_target_lost(
-    now: float,
-    tof_mm: list[int],
-    tof_age: float,
-) -> tuple[str, str, bool]:
-  """目標短暫消失／轉角／遮擋：寬限 → 依最後方位搜 → 自轉 → 逾時停止。"""
+def _recover_when_target_lost(now: float) -> tuple[str, str, bool]:
+  """目標短暫消失／轉角／遮擋：寬限 → 依最後方位搜 → 自轉 → 逾時停止。
+  （VL53 停用：無側牆／後方 ToF 覆寫）"""
   global target_lost_since, search_spin_since, search_exhausted, follow_recovery_note
 
   if target_lost_since is None:
@@ -652,19 +555,17 @@ def _recover_when_target_lost(
     follow_recovery_note = f'lost grace {lost_for:.1f}s hold'
     return 'S', follow_recovery_note, False
 
-  # 情境3／4：先往「最後看到的方位」轉，避免盲目原地轉錯邊
+  # 情境3／4：先往「最後看到的方位」轉
   bias_for = lost_for - LOST_GRACE_SECONDS
   if bias_for < SEARCH_BIAS_SECONDS:
     if last_seen_offset < -0.05:
-      cmd, note = _apply_tof_motion_guard('L', tof_mm, tof_age)
-      follow_recovery_note = f'search bias L ({note or "last offset"})'
-      return cmd, follow_recovery_note, False
+      follow_recovery_note = 'search bias L (last offset)'
+      return 'L', follow_recovery_note, False
     if last_seen_offset > 0.05:
-      cmd, note = _apply_tof_motion_guard('R', tof_mm, tof_age)
-      follow_recovery_note = f'search bias R ({note or "last offset"})'
-      return cmd, follow_recovery_note, False
+      follow_recovery_note = 'search bias R (last offset)'
+      return 'R', follow_recovery_note, False
 
-  # 全域自轉；後方過近則停；逾時停止避免無限轉（無 AOA）
+  # 全域自轉；逾時停止（無 AOA／無 VL53 後方防護）
   if search_spin_since is None:
     search_spin_since = now
   spun = now - search_spin_since
@@ -674,21 +575,19 @@ def _recover_when_target_lost(
     print(f'⚠️ {follow_recovery_note}', flush=True)
     return 'S', follow_recovery_note, False
 
-  cmd, note = _apply_tof_motion_guard('Z', tof_mm, tof_age)
-  follow_recovery_note = f'search spin {spun:.1f}s' + (f' ({note})' if note else '')
-  return cmd, follow_recovery_note, False
+  follow_recovery_note = f'search spin {spun:.1f}s'
+  return 'Z', follow_recovery_note, False
 
 
 def _stuck_recover(
     cmd: str,
     distance: float | None,
     dist_ok: bool,
-    tof_mm: list[int],
-    tof_age: float,
     now: float,
 ) -> tuple[str, str]:
   """
   情境5：無碰觸開關時，用「一直 F 但 UWB 距離沒拉近」推估卡住／細障。
+  VL53 停用：卡住時直接停（無側向空檔判斷）。
   """
   global stuck_forward_since, stuck_dist_ref, follow_recovery_note
 
@@ -711,17 +610,8 @@ def _stuck_recover(
     stuck_dist_ref = distance
     return cmd, ''
 
-  # 卡住：往較空側偏轉再開；ToF 不可用則停
   stuck_forward_since = None
   stuck_dist_ref = None
-  if _tof_fresh(tof_age) and len(tof_mm) >= 3:
-    fl, fr = int(tof_mm[0]), int(tof_mm[2])
-    if fl > fr + TOF_OPEN_MARGIN:
-      follow_recovery_note = 'stuck: UWB not closing -> L'
-      return 'L', follow_recovery_note
-    if fr > fl + TOF_OPEN_MARGIN:
-      follow_recovery_note = 'stuck: UWB not closing -> R'
-      return 'R', follow_recovery_note
   follow_recovery_note = 'stuck: UWB not closing -> S'
   return 'S', follow_recovery_note
 
@@ -735,8 +625,6 @@ def decide_command(
     prev_forward: bool,
     fall_emergency: bool = False,
     need_lock: bool = False,
-    tof_mm: list[int] | None = None,
-    tof_age: float = 999.0,
     now: float | None = None,
 ) -> tuple[str, str, bool]:
   global last_seen_offset, target_lost_since, search_spin_since
@@ -744,8 +632,6 @@ def decide_command(
 
   if now is None:
     now = time.time()
-  if tof_mm is None:
-    tof_mm = [8190, 8190, 8190, 8190]
 
   if fall_emergency:
     follow_recovery_note = ''
@@ -768,7 +654,7 @@ def decide_command(
   if not has_person:
     stuck_forward_since = None
     stuck_dist_ref = None
-    return _recover_when_target_lost(now, tof_mm, tof_age)
+    return _recover_when_target_lost(now)
 
   # 重新看到指定人：清搜尋狀態
   last_seen_offset = float(offset)
@@ -794,17 +680,8 @@ def decide_command(
     else:
       cmd, status, nxt = 'S', f'centered band {distance:.2f}m -> keep S', False
 
-  # 情境1／2：ToF 走道與前方防護
-  guarded, gnote = _apply_tof_motion_guard(cmd, tof_mm, tof_age)
-  if gnote:
-    status = f'{status} | {gnote}'
-    follow_recovery_note = gnote
-  cmd = guarded
-  if cmd != 'F':
-    nxt = False if cmd in {'S', 'X', 'Z'} else prev_forward
-
-  # 情境5：前進卡住推估
-  stuck_cmd, snote = _stuck_recover(cmd, distance, dist_ok, tof_mm, tof_age, now)
+  # 情境5：前進卡住推估（無 VL53 側向）
+  stuck_cmd, snote = _stuck_recover(cmd, distance, dist_ok, now)
   if snote:
     status = f'{status} | {snote}'
     follow_recovery_note = snote
@@ -984,7 +861,6 @@ def draw_hud(
     detecting: bool,
     fall_txt: str,
     lock_txt: str,
-    tof_mm: list[int],
 ):
   h, w = frame.shape[:2]
   cx = w // 2
@@ -999,12 +875,9 @@ def draw_hud(
     stale = ' (stale)' if dist_age > UWB_STALE_SECONDS else ''
     dist_txt = f'UWB: {distance:.2f}m{stale}'
 
-  tof_txt = 'ToF: ' + ','.join(str(v) for v in tof_mm)
-
   lines = [
       f'FOLLOW: {"ON" if following else "OFF"}  FALL: {"ON" if detecting else "OFF"}  CMD: {cmd}',
       dist_txt,
-      tof_txt[:52],
       lock_txt[:52],
       f'offset: {offset:+.2f}' if has_person else 'target: none',
       status[:52],
@@ -1036,11 +909,11 @@ def control_loop() -> None:
         flush=True,
     )
   else:
-    print('=== CONTROL LOOP RUNNING (follow + fall + lock + tof) ===', flush=True)
+    print('=== CONTROL LOOP RUNNING (follow + fall + lock) ===', flush=True)
   frame_interval = 1.0 / fall.CLIP_FPS
 
   while not control_stop.is_set():
-    # 無相機：仍刷新佔位畫面與手動／急停，讓網頁 UWB／ToF 可看
+    # 無相機：仍刷新佔位畫面與手動／急停，讓網頁 UWB 可看
     if not camera_ok:
       now = time.time()
       with state_lock:
@@ -1049,24 +922,14 @@ def control_loop() -> None:
         man_until = manual_cmd_until
         distance = latest_distance
         dist_age = now - last_distance_time if last_distance_time else 999.0
-        tof_snapshot = list(latest_tof_mm)
-        tof_age = now - last_tof_time if last_tof_time else 999.0
 
       cmd, status = 'S', 'no camera: follow vision disabled'
       next_forward = False
       if man_cmd and now <= man_until:
         cmd, status, next_forward = man_cmd, f'manual {man_cmd}', man_cmd == 'F'
       elif following:
-        status = 'no camera: auto-follow paused (UWB/ToF live)'
+        status = 'no camera: auto-follow paused (UWB live)'
 
-      # 無相機時仍套用 ToF 防護（手動前進不會硬撞）
-      if cmd in {'F', 'L', 'R', 'Z'}:
-        guarded, gnote = _apply_tof_motion_guard(cmd, tof_snapshot, tof_age)
-        if gnote:
-          status = f'{status} | {gnote}'
-        cmd = guarded
-
-      # 勿 force：避免每圈狂送 S 干擾 UNO 讀 VL53
       motor.send(cmd, force=(cmd == 'X'))
       with state_lock:
         latest_cmd = cmd
@@ -1074,7 +937,7 @@ def control_loop() -> None:
         person_seen = False
         was_forward = next_forward
         fall_status = 'fall: need camera'
-      _publish_jpeg(_placeholder_frame('NO CAMERA — UWB/ToF only'))
+      _publish_jpeg(_placeholder_frame('NO CAMERA — UWB only'))
       time.sleep(0.2)
       continue
 
@@ -1133,8 +996,6 @@ def control_loop() -> None:
         distance = latest_distance
         dist_age = time.time() - last_distance_time if last_distance_time else 999.0
         prev_forward = was_forward
-        tof_snapshot = list(latest_tof_mm)
-        tof_age = time.time() - last_tof_time if last_tof_time else 999.0
         man_cmd = manual_cmd
         man_until = manual_cmd_until
         locked = locked_target_id
@@ -1161,8 +1022,6 @@ def control_loop() -> None:
           prev_forward,
           fall_emergency=fall_emergency,
           need_lock=need_lock,
-          tof_mm=tof_snapshot,
-          tof_age=tof_age,
           now=now,
       )
 
@@ -1215,7 +1074,6 @@ def control_loop() -> None:
           detecting,
           f_status,
           lock_txt,
-          tof_snapshot,
       )
       ret, jpg = cv2.imencode('.jpg', hud)
       if ret:
@@ -1317,7 +1175,7 @@ INDEX_HTML = """
       <button class="ghost" onclick="api('/api/clear_alert','POST')">解除警報狀態</button>
     </div>
     <h1>跌倒偵測 + 視覺跟隨（鎖定目標版）</h1>
-    <p class="sub">version {{ version }}｜UWB + 4×VL53L0X｜ByteTrack 特定人鎖定</p>
+    <p class="sub">version {{ version }}｜UWB｜ByteTrack 特定人鎖定｜VL53 已停用</p>
 
     <div class="grid">
       <section class="card">
@@ -1358,27 +1216,15 @@ INDEX_HTML = """
           <div class="sub" id="uwbAge">freshness: --</div>
         </section>
 
-        <section class="card">
-          <h2>VL53L0X（mm）左前／正前／右前／正後</h2>
-          <div class="tof-grid" id="tofGrid"></div>
-          <div class="sub" id="tofAge" style="margin-top:8px">ToF age: --</div>
-        </section>
       </aside>
     </div>
 
     <p class="hint">
-      置中死區 ±{{ deadzone }}｜前進 ≥ {{ start }}m｜停止 &lt; {{ stop }}m｜跌倒確認 {{ confirm }}s｜靈敏度 {{ sens }}｜避障 {{ avoid }}mm<br/>
+      置中死區 ±{{ deadzone }}｜前進 ≥ {{ start }}m｜停止 &lt; {{ stop }}m｜跌倒確認 {{ confirm }}s｜靈敏度 {{ sens }}｜VL53 已停用<br/>
       UWB/Motor: {{ uwb }}｜手勢鎖定: {{ gesture }}｜{{ version }}
     </p>
   </main>
-  <script id="boot-json" type="application/json">{{ labels_json | safe }}</script>
   <script>
-    const AVOID = {{ avoid }};
-    let LABELS = ['左前', '正前', '右前', '正後'];
-    try {
-      const boot = document.getElementById('boot-json');
-      if (boot && boot.textContent) LABELS = JSON.parse(boot.textContent);
-    } catch (e) { console.warn('LABELS parse', e); }
     let holdTimer = null;
     let following = false;
 
@@ -1416,29 +1262,6 @@ INDEX_HTML = """
       });
     }
 
-    function renderTof(vals, age) {
-      const root = document.getElementById('tofGrid');
-      if (!root) return;
-      root.innerHTML = '';
-      const list = (vals && vals.length) ? vals : [8190,8190,8190,8190];
-      list.forEach((v, i) => {
-        const danger = Number(v) < AVOID;
-        const pct = Math.max(0, Math.min(100, (Number(v) / 1000) * 100));
-        const div = document.createElement('div');
-        div.className = 'tof' + (danger ? ' danger' : '');
-        div.innerHTML = '<div class="l">' + (LABELS[i] || ('T' + i)) + '</div>' +
-          '<div class="v">' + v + '</div>' +
-          '<div class="meter"><span style="width:' + pct + '%"></span></div>';
-        root.appendChild(div);
-      });
-      const ageEl = document.getElementById('tofAge');
-      if (ageEl) {
-        const a = Number(age);
-        ageEl.textContent = 'ToF age: ' + (Number.isFinite(a) ? a.toFixed(2) : '--') +
-          's' + (a > 1 ? ' (stale)' : '');
-      }
-    }
-
     async function refresh() {
       try {
         const r = await fetch('/api/status?t=' + Date.now(), { cache: 'no-store' });
@@ -1472,7 +1295,6 @@ INDEX_HTML = """
             's (' + (uwbStale ? '逾時 stale' : '正常') + ')';
         }
 
-        renderTof(j.tof_mm, j.tof_age);
 
         let fallLine = j.fall_status || '';
         if (j.fall_suspect_elapsed > 0 && j.fall_suspect_elapsed < j.fall_confirm_seconds) {
@@ -1526,11 +1348,9 @@ def index():
       stop=STOP_DIST,
       confirm=fall.FALL_CONFIRM_SECONDS,
       sens=fall.FALL_SENSITIVITY,
-      avoid=AVOID_MM,
       uwb=UWB_SERIAL_PORT,
       gesture='ON' if ENABLE_GESTURE_LOCK else 'OFF',
       version=APP_VERSION,
-      labels_json=json.dumps(list(TOF_LABELS), ensure_ascii=False),
   )
 
 
@@ -1661,7 +1481,6 @@ def status():
   with state_lock:
     dist = latest_distance
     age = time.time() - last_distance_time if last_distance_time else 999.0
-    tof_age = time.time() - last_tof_time if last_tof_time else 999.0
     return jsonify(
         {
             'following': is_following,
@@ -1676,10 +1495,7 @@ def status():
             'distance': dist,
             'distance_age': age,
             'uwb_stale_seconds': UWB_STALE_SECONDS,
-            'tof_mm': list(latest_tof_mm),
-            'tof_age': tof_age,
-            'tof_labels': list(TOF_LABELS),
-            'avoid_mm': AVOID_MM,
+            'vl53_enabled': False,
             'recovery': follow_recovery_note,
             'search_exhausted': search_exhausted,
             'person_seen': person_seen,
@@ -1700,7 +1516,7 @@ if __name__ == '__main__':
   print(f'=== APP_VERSION={APP_VERSION} ===', flush=True)
   print(f'=== FILE={Path(__file__).resolve()} ===', flush=True)
   print(f'=== FALL_SENSITIVITY={fall.FALL_SENSITIVITY:g} ===', flush=True)
-  print(f'=== TRACKER={TRACKER_CFG} AVOID_MM={AVOID_MM} ===', flush=True)
+  print(f'=== TRACKER={TRACKER_CFG} VL53=disabled ===', flush=True)
   uwb_reader.start()
   motor.open()
   print('=== STARTING CONTROL THREAD ===', flush=True)
