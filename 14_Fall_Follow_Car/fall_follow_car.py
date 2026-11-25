@@ -28,7 +28,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / '.env')
 import line_media as fall  # noqa: E402
 
-APP_VERSION = 'fall-follow-2026-11-25-nocam-telemetry'
+APP_VERSION = 'fall-follow-2026-11-25-status-fix'
 
 # --- 硬體 / 網路 ---
 CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
@@ -1365,9 +1365,14 @@ INDEX_HTML = """
       UWB/Motor: {{ uwb }}｜手勢鎖定: {{ gesture }}｜{{ version }}
     </p>
   </main>
+  <script id="boot-json" type="application/json">{{ labels_json | safe }}</script>
   <script>
     const AVOID = {{ avoid }};
-    const LABELS = {{ labels_json }};
+    let LABELS = ['左前', '正前', '右前', '正後'];
+    try {
+      const boot = document.getElementById('boot-json');
+      if (boot && boot.textContent) LABELS = JSON.parse(boot.textContent);
+    } catch (e) { console.warn('LABELS parse', e); }
     let holdTimer = null;
     let following = false;
 
@@ -1407,73 +1412,99 @@ INDEX_HTML = """
 
     function renderTof(vals, age) {
       const root = document.getElementById('tofGrid');
+      if (!root) return;
       root.innerHTML = '';
-      (vals || [8190,8190,8190,8190]).forEach((v, i) => {
-        const danger = v < AVOID;
-        const pct = Math.max(0, Math.min(100, (v / 1000) * 100));
+      const list = (vals && vals.length) ? vals : [8190,8190,8190,8190];
+      list.forEach((v, i) => {
+        const danger = Number(v) < AVOID;
+        const pct = Math.max(0, Math.min(100, (Number(v) / 1000) * 100));
         const div = document.createElement('div');
         div.className = 'tof' + (danger ? ' danger' : '');
-        div.innerHTML = `<div class="l">${LABELS[i]}</div>
-          <div class="v">${v}</div>
-          <div class="meter"><span style="width:${pct}%"></span></div>`;
+        div.innerHTML = '<div class="l">' + (LABELS[i] || ('T' + i)) + '</div>' +
+          '<div class="v">' + v + '</div>' +
+          '<div class="meter"><span style="width:' + pct + '%"></span></div>';
         root.appendChild(div);
       });
-      document.getElementById('tofAge').textContent =
-        `ToF age: ${age.toFixed(2)}s` + (age > 1 ? ' (stale)' : '');
+      const ageEl = document.getElementById('tofAge');
+      if (ageEl) {
+        const a = Number(age);
+        ageEl.textContent = 'ToF age: ' + (Number.isFinite(a) ? a.toFixed(2) : '--') +
+          's' + (a > 1 ? ' (stale)' : '');
+      }
     }
 
     async function refresh() {
       try {
-      const r = await fetch('/api/status');
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      const j = await r.json();
-      setManualEnabled(!!j.following);
+        const r = await fetch('/api/status?t=' + Date.now(), { cache: 'no-store' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const j = await r.json();
+        setManualEnabled(!!j.following);
 
-      const banner = document.getElementById('alertBanner');
-      if (j.fall_alert_active) {
-        banner.classList.add('show');
-        document.getElementById('alertText').textContent =
-          `已確認跌倒！ ${j.fall_alert_ts || ''}`;
-      } else {
-        banner.classList.remove('show');
-      }
+        const banner = document.getElementById('alertBanner');
+        if (banner) {
+          if (j.fall_alert_active) {
+            banner.classList.add('show');
+            const at = document.getElementById('alertText');
+            if (at) at.textContent = '已確認跌倒！ ' + (j.fall_alert_ts || '');
+          } else {
+            banner.classList.remove('show');
+          }
+        }
 
-      const uwbStale = j.distance_age > j.uwb_stale_seconds;
-      document.getElementById('uwbBox').textContent =
-        j.distance == null ? '-- m' : `${j.distance.toFixed(2)} m`;
-      document.getElementById('uwbAge').textContent =
-        `freshness: ${j.distance_age.toFixed(2)}s (${uwbStale ? '逾時 stale' : '正常'})`;
+        const dist = j.distance;
+        const dAge = Number(j.distance_age);
+        const uwbStale = dAge > Number(j.uwb_stale_seconds || 1);
+        const uwbBox = document.getElementById('uwbBox');
+        const uwbAge = document.getElementById('uwbAge');
+        if (uwbBox) {
+          uwbBox.textContent = (dist === null || dist === undefined)
+            ? '-- m' : (Number(dist).toFixed(2) + ' m');
+        }
+        if (uwbAge) {
+          uwbAge.textContent = 'freshness: ' +
+            (Number.isFinite(dAge) ? dAge.toFixed(2) : '--') +
+            's (' + (uwbStale ? '逾時 stale' : '正常') + ')';
+        }
 
-      renderTof(j.tof_mm, j.tof_age);
+        renderTof(j.tof_mm, j.tof_age);
 
-      let fallLine = j.fall_status;
-      if (j.fall_suspect_elapsed > 0 && j.fall_suspect_elapsed < j.fall_confirm_seconds) {
-        fallLine = `疑似跌倒計時中: ${j.fall_suspect_elapsed.toFixed(1)} / ${j.fall_confirm_seconds.toFixed(1)}s`;
-      } else if ((j.fall_status || '').startsWith('FALL confirmed')) {
-        fallLine = '已確認跌倒！';
-      } else if ((j.fall_status || '').includes('normal')) {
-        fallLine = '正常';
-      }
+        let fallLine = j.fall_status || '';
+        if (j.fall_suspect_elapsed > 0 && j.fall_suspect_elapsed < j.fall_confirm_seconds) {
+          fallLine = '疑似跌倒計時中: ' + Number(j.fall_suspect_elapsed).toFixed(1) +
+            ' / ' + Number(j.fall_confirm_seconds).toFixed(1) + 's';
+        } else if (String(fallLine).startsWith('FALL confirmed')) {
+          fallLine = '已確認跌倒！';
+        } else if (String(fallLine).includes('normal')) {
+          fallLine = '正常';
+        }
 
-      document.getElementById('status').textContent =
-        `跟隨: ${j.following ? 'ON' : 'OFF'}\\n` +
-        `跌倒偵測: ${j.detecting ? 'ON' : 'OFF'}\\n` +
-        `鎖定: ${j.locked_target_id == null ? '未鎖定（等待目標）' : '已鎖定 ID: ' + j.locked_target_id}\\n` +
-        `命令: ${j.cmd}\\n` +
-        `人體目標: ${j.person_seen ? 'yes' : 'no'}  offset=${j.offset.toFixed(2)}\\n` +
-        `UWB: ${j.uwb_ok ? 'OK' : 'FAIL'} ${j.uwb_error || ''}\\n` +
-        `Motor: ${j.motor_ok ? 'OK' : 'FAIL'} ${j.motor_error || ''}\\n` +
-        `跟隨狀態: ${j.status}\\n` +
-        `復原: ${j.recovery || '-'}\\n` +
-        `跌倒狀態: ${fallLine}`;
+        const st = document.getElementById('status');
+        if (st) {
+          st.textContent =
+            '跟隨: ' + (j.following ? 'ON' : 'OFF') + '\\n' +
+            '跌倒偵測: ' + (j.detecting ? 'ON' : 'OFF') + '\\n' +
+            '鎖定: ' + (j.locked_target_id == null ? '未鎖定（等待目標）' : ('已鎖定 ID: ' + j.locked_target_id)) + '\\n' +
+            '命令: ' + (j.cmd || '') + '\\n' +
+            '人體目標: ' + (j.person_seen ? 'yes' : 'no') +
+            '  offset=' + Number(j.offset || 0).toFixed(2) + '\\n' +
+            'UWB: ' + (j.uwb_ok ? 'OK' : 'FAIL') + ' ' + (j.uwb_error || '') + '\\n' +
+            'Motor: ' + (j.motor_ok ? 'OK' : 'FAIL') + ' ' + (j.motor_error || '') + '\\n' +
+            '跟隨狀態: ' + (j.status || '') + '\\n' +
+            '復原: ' + (j.recovery || '-') + '\\n' +
+            '跌倒狀態: ' + fallLine;
+        }
       } catch (e) {
-        document.getElementById('status').textContent =
-          '狀態更新失敗: ' + e + '\\n請確認程式仍在執行，並硬重新整理頁面';
+        console.error('refresh failed', e);
+        const st = document.getElementById('status');
+        if (st) {
+          st.textContent = '狀態更新失敗: ' + e +
+            '\\n請硬重新整理，或在終端機執行: curl -s http://127.0.0.1:5001/api/status';
+        }
       }
     }
 
     refresh();
-    setInterval(refresh, 300);
+    setInterval(refresh, 400);
   </script>
 </body>
 </html>
