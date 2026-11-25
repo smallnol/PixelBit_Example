@@ -32,8 +32,8 @@
 | 樹莓派 | 不燒韌體；跑 `fall_follow_car.py` + `line_media.py` |
 
 ★ UNO D10 ← ESP32 GPIO17（馬達）  
-★ UNO D11 → ESP32 GPIO16（`O:mm`）  
-★ VL53 正前：VCC/GND/SDA/SCL + **XSHUT→D3**  
+★ UNO D11 → ESP32 GPIO16（`O:mm`，**要接**；馬達命令才是 D10）  
+★ VL53 正前：VCC/GND/SDA/SCL；**XSHUT 不接**  
 ★ 邏輯電：**3S 18650 → DC → XY3606 → USB-C → Pi 5**
 
 ## 操作順序（建議）

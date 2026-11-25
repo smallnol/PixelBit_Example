@@ -44,8 +44,11 @@ Tag --UWB--> 車上 ESP32 --USB--> Pi
                 GND 共地
 
 VL53 正前×1：
-  VCC→UNO 5V  GND  SDA→A4  SCL→A5  XSHUT→D3
+  VCC→UNO 5V  GND  SDA→A4  SCL→A5
+  XSHUT：不接
 ```
+
+★ **D11→GPIO16 仍要接**（回傳 `O:` 給 Pi）。不接則 UNO 本地仍可避障，但網頁看不到 ToF、Pi 端防護失效。
 
 ### 協定
 
@@ -102,7 +105,7 @@ python3 fall_follow_car.py
 
 | 現象 | 檢查 |
 |------|------|
-| 沒有 `O:` | D11↔GPIO16、VL53 供電／XSHUT D3、Pololu 庫 |
+| 沒有 `O:` | D11→GPIO16、VL53 供電／SDA／SCL、Pololu 庫 |
 | `O:` 一直 8190 | 遮擋／接線／init FAIL |
 | 沒有 `D:` | Tag 開機 |
 | 側撞／後撞 | **預期**：單顆只管正前 |

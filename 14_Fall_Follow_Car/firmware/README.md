@@ -22,9 +22,12 @@ UNO D11 → ESP32 GPIO16   （O: 正前 mm）
 GND 共地
 
 VL53×1 正前：
-  VCC→UNO 5V  GND→GND  SDA→A4  SCL→A5  XSHUT→D3
-  位址：預設 0x29（單顆不必改址）
+  VCC→UNO 5V  GND→GND  SDA→A4  SCL→A5
+  XSHUT：不接（懸空）
+  位址：預設 0x29
 ```
+
+★ **D11 → GPIO16 仍要接**，否則 Pi／網頁收不到 `O:`（馬達命令走 D10 那條）。
 
 ## 行為
 

@@ -8,10 +8,9 @@
  *   UNO D11 (SoftSerial TX) → ESP32 GPIO16（回傳 O:mm）
  *   GND 共地
  *
- * VL53L0X 正前：
+ * VL53L0X 正前（單顆）：
  *   VCC→UNO 5V、GND→GND、SDA→A4、SCL→A5
- *   XSHUT→D3（建議接；不接也可，多數模組板內建上拉）
- *   預設 I2C 位址 0x29（單顆不必改址）
+ *   XSHUT：不接（懸空即可；單顆用預設 0x29，不必改址）
  *
  * 庫：Wire、BMP73T104、SoftwareSerial、Pololu VL53L0X
  * USB 監看：115200
@@ -31,7 +30,6 @@ const unsigned long SOFT_RAMP_MS = 40;
 
 const uint16_t AVOID_MM = 250;
 const uint16_t TOF_FAIL_MM = 8190;
-const uint8_t XSHUT_PIN = 3;  // 正前
 
 const int BASE_FORWARD_SPEED = 85;
 const int BASE_TURN_SPEED = 60;
@@ -290,16 +288,11 @@ void pollPiCommands() {
 }
 
 bool initFrontTof() {
-  pinMode(XSHUT_PIN, OUTPUT);
-  digitalWrite(XSHUT_PIN, LOW);
+  // 單顆：不控 XSHUT，直接用預設位址 0x29
   delay(50);
-  digitalWrite(XSHUT_PIN, HIGH);
-  delay(80);
-
   tof.setTimeout(500);
   if (!tof.init()) {
     Serial.println(F("VL53 front init FAIL"));
-    digitalWrite(XSHUT_PIN, LOW);
     tofOk = false;
     return false;
   }

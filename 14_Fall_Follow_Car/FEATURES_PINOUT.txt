@@ -29,8 +29,8 @@ ESP32 GPIO17 → UNO D10；UNO D11 → ESP32 GPIO16
 
 【四、腳位】
 UNO D10 ← 命令；D11 → O:
-VL53 正前：VCC=5V GND SDA=A4 SCL=A5 XSHUT=D3（0x29）
-※ 不要接 D2/D4/D5 其他 VL53
+VL53 正前：VCC=5V GND SDA=A4 SCL=A5；XSHUT 不接（0x29）
+※ 不要接其他 VL53；D2～D5 不必當 XSHUT
 
 【五、燒錄】
 UNO：firmware/uno_car/uno_car.ino
@@ -39,8 +39,9 @@ Tag：uwb_tag_initiator（沿用）
 Pi：fall_follow_car.py + line_media.py
 
 【六、檢查清單】
-[ ] 只接一顆正前 VL53？XSHUT→D3？
+[ ] 只接一顆正前 VL53？XSHUT 懸空不接？
 [ ] 已燒 uno_car.ino（非 uno_car_vl53）？
-[ ] GPIO17→D10、D11→GPIO16、共地？
-[ ] 明白側／後方無雷射防護？
+[ ] GPIO17→D10（馬達）？
+[ ] D11→GPIO16（O: 回傳，要接才看得到網頁 ToF）？
+[ ] 共地？明白側／後方無雷射防護？
 ================================================================================
