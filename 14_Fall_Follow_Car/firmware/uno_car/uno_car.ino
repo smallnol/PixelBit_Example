@@ -30,6 +30,10 @@ const unsigned long SOFT_RAMP_MS = 40;
 
 const uint16_t AVOID_MM = 250;
 const uint16_t TOF_FAIL_MM = 8190;
+// 距離校正：實際 ≈ 讀值 + TOF_OFFSET_MM
+// 例：尺量 150mm、序列 171~174 → 偏高約 22mm → 設 -22
+// 改完請重燒 UNO；再尺量一次微調
+const int16_t TOF_OFFSET_MM = -22;
 
 const int BASE_FORWARD_SPEED = 85;
 const int BASE_TURN_SPEED = 60;
@@ -212,8 +216,11 @@ uint16_t readTofMm() {
   if (!tofOk) return TOF_FAIL_MM;
   uint16_t mm = tof.readRangeSingleMillimeters();
   if (tof.timeoutOccurred() || mm == 0) return TOF_FAIL_MM;
-  if (mm > TOF_FAIL_MM) mm = TOF_FAIL_MM;
-  return mm;
+  if (mm >= TOF_FAIL_MM) return TOF_FAIL_MM;
+  int32_t corrected = (int32_t)mm + (int32_t)TOF_OFFSET_MM;
+  if (corrected < 1) corrected = 1;
+  if (corrected >= (int32_t)TOF_FAIL_MM) return TOF_FAIL_MM;
+  return (uint16_t)corrected;
 }
 
 void pollTof() {
@@ -337,7 +344,11 @@ void setup() {
   requestedCmd = CMD_STOP;
   lastCmdTime = millis();
 
-  Serial.println(F("命令 F/L/R/Z/S/X｜O:正前mm｜AVOID 250mm｜僅 F 避障"));
+  Serial.print(F("命令 F/L/R/Z/S/X｜O:正前mm｜AVOID "));
+  Serial.print(AVOID_MM);
+  Serial.print(F("｜offset "));
+  Serial.print(TOF_OFFSET_MM);
+  Serial.println(F("mm｜僅 F 避障"));
 }
 
 void loop() {
