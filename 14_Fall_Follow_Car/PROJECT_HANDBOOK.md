@@ -65,14 +65,16 @@
                 ▼                              ▼
         車上 ESP32-UWB                  樹莓派 5 + 相機
         (Responder)                    YOLOv8-pose
-                │ USB: D:xx.xx                 │
+                │ USB: D:xx.xx / O:a,b,c,d     │
                 │ USB: F/L/R/Z/S/X 命令 ◄──────┘
-                │ GPIO17 (TX2)
-                ▼
-              Arduino UNO（Pi-slave 韌體）
                 │
+     GPIO17 → UNO D10（命令）
+     GPIO16 ← UNO D11（O: 四顆 ToF）
                 ▼
-           馬達驅動 / 底盤
+         Arduino UNO + 4×VL53L0X
+                │ I2C
+                ▼
+         BMP73T104 / 四輪馬達
 ```
 
 ### 3.2 軟體三層演進（專題故事線）
@@ -97,11 +99,12 @@
 | `events/pending/` | 疑似跌倒暫存（未確認會刪） |
 | `events/confirmed/` | 已確認事件媒體留存 |
 
-韌體／硬體相關（通常在 `uwb-follow-car` 或同生態 repo）：
+韌體位置：
 
-- 車上 UWB Responder（距離字串 `D:x.xx` + USB 命令轉 Serial2）
-- 人身上 UWB Tag Initiator
-- UNO `uno_car`（Pi-slave：聽單字母 `F/L/R/Z/S/X`）
+- 車上 UWB Responder：`14_Fall_Follow_Car/firmware/uwb_car_responder/`（`D:` + 轉發命令 + 橋接 `O:`）
+- UNO：`14_Fall_Follow_Car/firmware/uno_car_vl53/`（馬達 + 4×VL53）
+- 身上 Tag：`uwb-follow-car` → `uwb_tag_initiator/`（**本輪 VL53 變更無需重燒 Tag**）
+- 腳位總表：`FEATURES_PINOUT.txt`；部署：`DEPLOY.md`
 
 ---
 
@@ -250,23 +253,27 @@ LINE 官方訊息**不能直接塞本機檔案**，必須是伺服器可抓的 *
 - 網路線／Wi-Fi（網頁預覽與 LINE 上傳）
 - （可選）cloudflared 做臨時 HTTPS 隧道
 
-### 6.2 建議接線（整合版 README 一致）
+### 6.2 建議接線（與 DEPLOY／FEATURES_PINOUT 一致）
 
 ```
 人身上 ESP32-UWB (Tag)  --UWB-->  車上 ESP32-UWB (Responder)
-                                         │ USB（距離 + 馬達命令）
+                                         │ USB（D: / O: / 馬達命令）
                                          ▼
                                     樹莓派 5 + 相機
                                          │
-                    車上 ESP32 GPIO17 ───┘（Serial2 轉發）
-                                         ▼
-                                    UNO D10（F/L/R/Z/S/X）
+              GPIO17 ────────────────────┘──► UNO D10（F/L/R/Z/S/X）
+              GPIO16 ◄────────────────────── UNO D11（O:左前,正前,右前,正後）
+              GND 共地
+
+邏輯電：3S 18650 → DC → XY3606（≈5.1V）→ USB-C → Pi 5
+馬達電：獨立電池 → BMP73T104（勿灌 UNO 5V）；兩電池只共地
+VL53×4：XSHUT D2～D5；SDA/SCL/VCC(建議5V)/GND 共用
 ```
 
 注意：
 
 - 拔掉錯誤接到 Pi 腳位直接當馬達 UART 的杜邦線（若曾試驗過）。
-- 18650／動力電池只接馬達電；UNO 用邏輯電；**電池 GND 共 UNO GND**。
+- **必接 D11→GPIO16**，否則網頁看不到 ToF。
 
 ### 6.3 馬達命令語意（UNO Pi-slave）
 

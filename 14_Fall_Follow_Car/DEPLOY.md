@@ -14,7 +14,7 @@
 |------|----------|------|
 | **車上 ESP32-UWB** | `firmware/uwb_car_responder/uwb_car_responder.ino` | 測距 `D:`；USB↔Pi；轉發馬達命令；橋接 `O:` |
 | **Arduino UNO** | `firmware/uno_car_vl53/uno_car_vl53.ino` | 馬達、4×VL53 避障、回傳 `O:` |
-| **身上 Tag ESP32** | `uwb-follow-car` → `uwb_tag_initiator`（沿用舊版） | 人身上測距標籤 |
+| **身上 Tag ESP32** | `uwb-follow-car` → `uwb_tag_initiator`（**沿用即可，不必因 VL53 重燒**） | 人身上測距標籤；與車上 Anchor 訊息格式已對齊 |
 | **樹莓派 5** | **不燒 .ino** | 跑 `fall_follow_car.py` + `line_media.py` |
 
 ### Arduino IDE 函式庫

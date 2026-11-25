@@ -5,7 +5,8 @@
 | 板子 | 檔案 |
 |------|------|
 | Arduino UNO | `uno_car_vl53/uno_car_vl53.ino` |
-| 車上 ESP32-UWB | `uwb_car_responder/uwb_car_responder.ino` |
+| 車上 ESP32-UWB（Anchor） | `uwb_car_responder/uwb_car_responder.ino` |
+| 身上 Tag ESP32 | 外掛 `uwb-follow-car` → `uwb_tag_initiator/`（本輪可沿用，不必因 VL53 重燒） |
 
 UNO 函式庫：`BMP73T104`、Pololu `VL53L0X`  
 ESP32 函式庫：`dw3000`
