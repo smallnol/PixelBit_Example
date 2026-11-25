@@ -28,7 +28,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / '.env')
 import line_media as fall  # noqa: E402
 
-APP_VERSION = 'fall-follow-2026-11-25-vl53x4-rear'
+APP_VERSION = 'fall-follow-2026-11-25-follow-recovery'
 
 # --- 硬體 / 網路 ---
 CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
@@ -70,8 +70,19 @@ YOLO_IMGSZ = int(os.getenv('YOLO_IMGSZ', '320'))
 STOP_FOLLOW_ON_FALL = os.getenv('STOP_FOLLOW_ON_FALL', '1').strip() not in {'0', 'false', 'False'}
 ENABLE_GESTURE_LOCK = os.getenv('ENABLE_GESTURE_LOCK', '1').strip() not in {'0', 'false', 'False'}
 GESTURE_LOCK_SECONDS = float(os.getenv('GESTURE_LOCK_SECONDS', '2.0'))
-HSV_REID_THRESHOLD = float(os.getenv('HSV_REID_THRESHOLD', '0.55'))
+HSV_REID_THRESHOLD = float(os.getenv('HSV_REID_THRESHOLD', '0.60'))
+# 目標遺失搜尋中提高 Re-ID 門檻，降低誤跟路人
+HSV_REID_SEARCH = float(os.getenv('HSV_REID_SEARCH', '0.72'))
 AVOID_MM = int(os.getenv('AVOID_MM', '250'))
+SIDE_AVOID_MM = int(os.getenv('SIDE_AVOID_MM', '220'))
+TOF_OPEN_MARGIN = int(os.getenv('TOF_OPEN_MARGIN', '30'))
+LOST_GRACE_SECONDS = float(os.getenv('LOST_GRACE_SECONDS', '1.0'))
+SEARCH_BIAS_SECONDS = float(os.getenv('SEARCH_BIAS_SECONDS', '3.0'))
+Z_TIMEOUT_SECONDS = float(os.getenv('Z_TIMEOUT_SECONDS', '12.0'))
+STUCK_SECONDS = float(os.getenv('STUCK_SECONDS', '4.0'))
+STUCK_DIST_EPS = float(os.getenv('STUCK_DIST_EPS', '0.15'))
+CORRIDOR_NUDGE_MM = int(os.getenv('CORRIDOR_NUDGE_MM', '400'))
+CORRIDOR_BIAS_MM = int(os.getenv('CORRIDOR_BIAS_MM', '80'))
 TRACKER_CFG = os.getenv('TRACKER_CFG', 'bytetrack.yaml').strip() or 'bytetrack.yaml'
 
 DIST_LINE_RE = re.compile(r'D:\s*([0-9]+(?:\.[0-9]+)?)', re.IGNORECASE)
@@ -116,6 +127,15 @@ lock_request_center = False
 gesture_raise_since: dict[int, float] = {}
 manual_cmd: str | None = None
 manual_cmd_until = 0.0
+
+# --- 跟隨復原／避障狀態（對應走道、遮擋、轉角等情境）---
+last_seen_offset = 0.0
+target_lost_since: float | None = None
+search_spin_since: float | None = None
+search_exhausted = False
+stuck_forward_since: float | None = None
+stuck_dist_ref: float | None = None
+follow_recovery_note = ''
 
 print('正在載入 YOLO-pose...')
 model = YOLO('yolov8n-pose.pt')
@@ -467,12 +487,13 @@ def resolve_locked_target(people: list[dict], frame: np.ndarray) -> tuple[dict |
         locked_target_hist = p['hist']
       return p, f'locked id={locked_target_id}'
 
-  # ByteTrack 換 ID → HSV 重連
+  # ByteTrack 換 ID → HSV 重連（搜尋中用更高門檻，避免誤跟路人）
   if locked_target_hist is not None and people:
+    thr = HSV_REID_SEARCH if target_lost_since is not None else HSV_REID_THRESHOLD
     scored = []
     for p in people:
       sim = hist_similarity(locked_target_hist, p['hist'])
-      if p['track_id'] is not None and sim >= HSV_REID_THRESHOLD:
+      if p['track_id'] is not None and sim >= thr:
         scored.append((sim, p))
     if scored:
       scored.sort(key=lambda x: x[0], reverse=True)
@@ -481,12 +502,169 @@ def resolve_locked_target(people: list[dict], frame: np.ndarray) -> tuple[dict |
       locked_target_id = best_p['track_id']
       locked_target_hist = best_p['hist']
       print(
-          f'🔁 HSV Re-ID: {old} → {locked_target_id} (sim={best_sim:.2f})',
+          f'🔁 HSV Re-ID: {old} → {locked_target_id} '
+          f'(sim={best_sim:.2f}, thr={thr:.2f})',
           flush=True,
       )
       return best_p, f're-id {old}->{locked_target_id}'
 
   return None, f'locked id={locked_target_id} LOST'
+
+
+def _tof_fresh(tof_age: float) -> bool:
+  return tof_age <= TOF_STALE_SECONDS
+
+
+def _front_avoid_cmd(fl: int, ff: int, fr: int) -> str | None:
+  """前方過近時回傳覆寫命令；無須覆寫則 None。"""
+  blocked = (fl < AVOID_MM) or (ff < AVOID_MM) or (fr < AVOID_MM)
+  if not blocked:
+    return None
+  if fl < AVOID_MM and ff < AVOID_MM and fr < AVOID_MM:
+    return 'S'
+  if fl > fr + TOF_OPEN_MARGIN:
+    return 'L'
+  if fr > fl + TOF_OPEN_MARGIN:
+    return 'R'
+  return 'S'
+
+
+def _apply_tof_motion_guard(
+    cmd: str,
+    tof_mm: list[int],
+    tof_age: float,
+) -> tuple[str, str]:
+  """
+  Pi 端 ToF 防護：走道側牆、前方矮障、自轉後方。
+  與 UNO 底層雙保險；不用 AOA。
+  """
+  if cmd in {'S', 'X'} or not _tof_fresh(tof_age) or len(tof_mm) < 4:
+    return cmd, ''
+
+  fl, ff, fr, rear = (int(tof_mm[0]), int(tof_mm[1]), int(tof_mm[2]), int(tof_mm[3]))
+  note = ''
+
+  if cmd == 'Z' and rear < AVOID_MM:
+    return 'S', 'tof: rear blocked stop Z'
+
+  # 禁止往近牆側轉（情境1）
+  if cmd == 'L' and fl < SIDE_AVOID_MM:
+    if fr > fl + TOF_OPEN_MARGIN:
+      return 'R', 'tof: left wall -> bias R'
+    return 'S', 'tof: left wall hold'
+  if cmd == 'R' and fr < SIDE_AVOID_MM:
+    if fl > fr + TOF_OPEN_MARGIN:
+      return 'L', 'tof: right wall -> bias L'
+    return 'S', 'tof: right wall hold'
+
+  if cmd == 'F':
+    avoid = _front_avoid_cmd(fl, ff, fr)
+    if avoid is not None:
+      return avoid, f'tof: front avoid -> {avoid}'
+    # 走道置中微偏：一側明顯較近牆則往另一側靠
+    if fl < CORRIDOR_NUDGE_MM and fl < fr - CORRIDOR_BIAS_MM:
+      return 'R', 'tof: corridor nudge R'
+    if fr < CORRIDOR_NUDGE_MM and fr < fl - CORRIDOR_BIAS_MM:
+      return 'L', 'tof: corridor nudge L'
+
+  return cmd, note
+
+
+def _recover_when_target_lost(
+    now: float,
+    tof_mm: list[int],
+    tof_age: float,
+) -> tuple[str, str, bool]:
+  """目標短暫消失／轉角／遮擋：寬限 → 依最後方位搜 → 自轉 → 逾時停止。"""
+  global target_lost_since, search_spin_since, search_exhausted, follow_recovery_note
+
+  if target_lost_since is None:
+    target_lost_since = now
+    search_spin_since = None
+
+  if search_exhausted:
+    follow_recovery_note = 'search exhausted: hold S (re-acquire or unlock)'
+    return 'S', follow_recovery_note, False
+
+  lost_for = now - target_lost_since
+
+  # 情境7：寬限內先停，給 YOLO／Re-ID 機會
+  if lost_for < LOST_GRACE_SECONDS:
+    follow_recovery_note = f'lost grace {lost_for:.1f}s hold'
+    return 'S', follow_recovery_note, False
+
+  # 情境3／4：先往「最後看到的方位」轉，避免盲目原地轉錯邊
+  bias_for = lost_for - LOST_GRACE_SECONDS
+  if bias_for < SEARCH_BIAS_SECONDS:
+    if last_seen_offset < -0.05:
+      cmd, note = _apply_tof_motion_guard('L', tof_mm, tof_age)
+      follow_recovery_note = f'search bias L ({note or "last offset"})'
+      return cmd, follow_recovery_note, False
+    if last_seen_offset > 0.05:
+      cmd, note = _apply_tof_motion_guard('R', tof_mm, tof_age)
+      follow_recovery_note = f'search bias R ({note or "last offset"})'
+      return cmd, follow_recovery_note, False
+
+  # 全域自轉；後方過近則停；逾時停止避免無限轉（無 AOA）
+  if search_spin_since is None:
+    search_spin_since = now
+  spun = now - search_spin_since
+  if spun >= Z_TIMEOUT_SECONDS:
+    search_exhausted = True
+    follow_recovery_note = f'Z timeout {spun:.0f}s -> S'
+    print(f'⚠️ {follow_recovery_note}', flush=True)
+    return 'S', follow_recovery_note, False
+
+  cmd, note = _apply_tof_motion_guard('Z', tof_mm, tof_age)
+  follow_recovery_note = f'search spin {spun:.1f}s' + (f' ({note})' if note else '')
+  return cmd, follow_recovery_note, False
+
+
+def _stuck_recover(
+    cmd: str,
+    distance: float | None,
+    dist_ok: bool,
+    tof_mm: list[int],
+    tof_age: float,
+    now: float,
+) -> tuple[str, str]:
+  """
+  情境5：無碰觸開關時，用「一直 F 但 UWB 距離沒拉近」推估卡住／細障。
+  """
+  global stuck_forward_since, stuck_dist_ref, follow_recovery_note
+
+  if cmd != 'F' or not dist_ok or distance is None:
+    stuck_forward_since = None
+    stuck_dist_ref = None
+    return cmd, ''
+
+  if stuck_forward_since is None:
+    stuck_forward_since = now
+    stuck_dist_ref = distance
+    return cmd, ''
+
+  if now - stuck_forward_since < STUCK_SECONDS:
+    return cmd, ''
+
+  moved_closer = distance < (stuck_dist_ref - STUCK_DIST_EPS)
+  if moved_closer:
+    stuck_forward_since = now
+    stuck_dist_ref = distance
+    return cmd, ''
+
+  # 卡住：往較空側偏轉再開；ToF 不可用則停
+  stuck_forward_since = None
+  stuck_dist_ref = None
+  if _tof_fresh(tof_age) and len(tof_mm) >= 3:
+    fl, fr = int(tof_mm[0]), int(tof_mm[2])
+    if fl > fr + TOF_OPEN_MARGIN:
+      follow_recovery_note = 'stuck: UWB not closing -> L'
+      return 'L', follow_recovery_note
+    if fr > fl + TOF_OPEN_MARGIN:
+      follow_recovery_note = 'stuck: UWB not closing -> R'
+      return 'R', follow_recovery_note
+  follow_recovery_note = 'stuck: UWB not closing -> S'
+  return 'S', follow_recovery_note
 
 
 def decide_command(
@@ -498,11 +676,28 @@ def decide_command(
     prev_forward: bool,
     fall_emergency: bool = False,
     need_lock: bool = False,
+    tof_mm: list[int] | None = None,
+    tof_age: float = 999.0,
+    now: float | None = None,
 ) -> tuple[str, str, bool]:
+  global last_seen_offset, target_lost_since, search_spin_since
+  global search_exhausted, stuck_forward_since, stuck_dist_ref, follow_recovery_note
+
+  if now is None:
+    now = time.time()
+  if tof_mm is None:
+    tof_mm = [8190, 8190, 8190, 8190]
+
   if fall_emergency:
+    follow_recovery_note = ''
     return 'X', 'FALL confirmed -> E-STOP', False
 
   if not following:
+    target_lost_since = None
+    search_spin_since = None
+    search_exhausted = False
+    stuck_forward_since = None
+    follow_recovery_note = ''
     return 'S', 'follow OFF (preview)', False
 
   if need_lock:
@@ -510,25 +705,54 @@ def decide_command(
 
   dist_ok = distance is not None and dist_age <= UWB_STALE_SECONDS
 
+  # 鎖定中但畫面丟目標 → 復原流程（非立刻 Z）
   if not has_person:
-    return 'Z', 'search: target lost -> spin', False
+    stuck_forward_since = None
+    stuck_dist_ref = None
+    return _recover_when_target_lost(now, tof_mm, tof_age)
+
+  # 重新看到指定人：清搜尋狀態
+  last_seen_offset = float(offset)
+  target_lost_since = None
+  search_spin_since = None
+  search_exhausted = False
+  follow_recovery_note = ''
 
   if offset < -CENTER_DEADZONE:
-    return 'L', f'turn LEFT (offset={offset:+.2f})', prev_forward
-  if offset > CENTER_DEADZONE:
-    return 'R', f'turn RIGHT (offset={offset:+.2f})', prev_forward
+    cmd, status, nxt = 'L', f'turn LEFT (offset={offset:+.2f})', prev_forward
+  elif offset > CENTER_DEADZONE:
+    cmd, status, nxt = 'R', f'turn RIGHT (offset={offset:+.2f})', prev_forward
+  elif not dist_ok:
+    cmd, status, nxt = 'S', 'centered but UWB stale -> stop', False
+  else:
+    assert distance is not None
+    if distance >= START_DIST:
+      cmd, status, nxt = 'F', f'centered dist {distance:.2f}m -> forward', True
+    elif distance < STOP_DIST:
+      cmd, status, nxt = 'S', f'centered dist {distance:.2f}m -> stop', False
+    elif prev_forward:
+      cmd, status, nxt = 'F', f'centered band {distance:.2f}m -> keep F', True
+    else:
+      cmd, status, nxt = 'S', f'centered band {distance:.2f}m -> keep S', False
 
-  if not dist_ok:
-    return 'S', 'centered but UWB stale -> stop', False
+  # 情境1／2：ToF 走道與前方防護
+  guarded, gnote = _apply_tof_motion_guard(cmd, tof_mm, tof_age)
+  if gnote:
+    status = f'{status} | {gnote}'
+    follow_recovery_note = gnote
+  cmd = guarded
+  if cmd != 'F':
+    nxt = False if cmd in {'S', 'X', 'Z'} else prev_forward
 
-  assert distance is not None
-  if distance >= START_DIST:
-    return 'F', f'centered dist {distance:.2f}m -> forward', True
-  if distance < STOP_DIST:
-    return 'S', f'centered dist {distance:.2f}m -> stop', False
-  if prev_forward:
-    return 'F', f'centered band {distance:.2f}m -> keep F', True
-  return 'S', f'centered band {distance:.2f}m -> keep S', False
+  # 情境5：前進卡住推估
+  stuck_cmd, snote = _stuck_recover(cmd, distance, dist_ok, tof_mm, tof_age, now)
+  if snote:
+    status = f'{status} | {snote}'
+    follow_recovery_note = snote
+    cmd = stuck_cmd
+    nxt = cmd == 'F'
+
+  return cmd, status, nxt
 
 
 def handle_fall_logic(pose, annotated_frame, detecting: bool) -> tuple[str, bool, float]:
@@ -809,6 +1033,7 @@ def control_loop() -> None:
         dist_age = time.time() - last_distance_time if last_distance_time else 999.0
         prev_forward = was_forward
         tof_snapshot = list(latest_tof_mm)
+        tof_age = time.time() - last_tof_time if last_tof_time else 999.0
         man_cmd = manual_cmd
         man_until = manual_cmd_until
         locked = locked_target_id
@@ -835,6 +1060,9 @@ def control_loop() -> None:
           prev_forward,
           fall_emergency=fall_emergency,
           need_lock=need_lock,
+          tof_mm=tof_snapshot,
+          tof_age=tof_age,
+          now=now,
       )
 
       # 手動遙控：跟隨 OFF 時才生效；X 永遠可急停
@@ -1132,6 +1360,7 @@ INDEX_HTML = """
         `UWB: ${j.uwb_ok ? 'OK' : 'FAIL'} ${j.uwb_error || ''}\\n` +
         `Motor: ${j.motor_ok ? 'OK' : 'FAIL'} ${j.motor_error || ''}\\n` +
         `跟隨狀態: ${j.status}\\n` +
+        `復原: ${j.recovery || '-'}\\n` +
         `跌倒狀態: ${fallLine}`;
     }
 
@@ -1230,10 +1459,18 @@ def api_lock_center():
 @app.route('/api/unlock_target', methods=['POST', 'GET'])
 def api_unlock_target():
   global locked_target_id, locked_target_hist, gesture_raise_since
+  global target_lost_since, search_spin_since, search_exhausted
+  global stuck_forward_since, stuck_dist_ref, follow_recovery_note
   with state_lock:
     locked_target_id = None
     locked_target_hist = None
     gesture_raise_since.clear()
+    target_lost_since = None
+    search_spin_since = None
+    search_exhausted = False
+    stuck_forward_since = None
+    stuck_dist_ref = None
+    follow_recovery_note = ''
   print('🔓 已解除目標鎖定', flush=True)
   return jsonify({'ok': True, 'locked_target_id': None})
 
@@ -1298,6 +1535,8 @@ def status():
             'tof_age': tof_age,
             'tof_labels': list(TOF_LABELS),
             'avoid_mm': AVOID_MM,
+            'recovery': follow_recovery_note,
+            'search_exhausted': search_exhausted,
             'person_seen': person_seen,
             'offset': person_offset,
             'locked_target_id': locked_target_id,

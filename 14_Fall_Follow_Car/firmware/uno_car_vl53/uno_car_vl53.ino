@@ -259,12 +259,30 @@ char applyObstacleOverride(char cmd) {
     return CMD_STOP;
   }
 
-  // 前方避障只在前進時介入
-  if (cmd != CMD_FORWARD) return cmd;
-
   uint16_t fl = tofMm[0];
   uint16_t ff = tofMm[1];
   uint16_t fr = tofMm[2];
+
+  // 側牆：禁止往過近側轉向（走道情境）
+  if (cmd == CMD_LEFT && tofOk[0] && fl < AVOID_MM) {
+    if (tofOk[2] && fr > fl + 30) {
+      Serial.println(F("AVOID: left wall -> R"));
+      return CMD_RIGHT;
+    }
+    Serial.println(F("AVOID: left wall -> S"));
+    return CMD_STOP;
+  }
+  if (cmd == CMD_RIGHT && tofOk[2] && fr < AVOID_MM) {
+    if (tofOk[0] && fl > fr + 30) {
+      Serial.println(F("AVOID: right wall -> L"));
+      return CMD_LEFT;
+    }
+    Serial.println(F("AVOID: right wall -> S"));
+    return CMD_STOP;
+  }
+
+  // 前方避障只在前進時介入
+  if (cmd != CMD_FORWARD) return cmd;
 
   bool frontBlocked = (fl < AVOID_MM) || (ff < AVOID_MM) || (fr < AVOID_MM);
   if (!frontBlocked) return CMD_FORWARD;
@@ -381,7 +399,7 @@ void setup() {
   if (!initTofSensors()) {
     Serial.println(F("警告：VL53 全部失敗，避障停用（馬達命令仍可用）"));
   }
-  Serial.println(F("命令 F/L/R/Z/S/X｜O:4｜AVOID 250mm｜rear on Z"));
+  Serial.println(F("命令 F/L/R/Z/S/X｜O:4｜AVOID 250mm｜rear Z｜side L/R"));
 }
 
 void loop() {

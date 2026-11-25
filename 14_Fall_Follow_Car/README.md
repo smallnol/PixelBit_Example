@@ -45,6 +45,7 @@
 - `PROJECT_HANDBOOK.md` — 專題說明書
 - `專題問答.txt` — 口試／報告備稿
 - `FEATURES_PINOUT.txt` — 功能＋腳位總表（核對用）
+- `FOLLOW_SCENARIOS.md` — 七種跟隨／避障情境改寫後判定
 - `DEPLOY.md` — 接線／供電／燒錄／Pi 指令
 - `web_preview/` — **網頁版面預覽**（靜態 HTML，不連 Pi）
 - `fall_follow_car.py` — 主程式
