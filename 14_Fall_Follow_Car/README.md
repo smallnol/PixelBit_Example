@@ -1,6 +1,6 @@
 # 跌倒偵測 + 視覺跟隨（整合版）
 
-把最新跌倒核心、視覺／UWB 跟隨、**5×VL53L0X（含下視防墜與後方）**、**特定人鎖定**、**網頁遙控／儀表板**合成一支程式（**暫不含 MaUWB AOA**）。
+把最新跌倒核心、視覺／UWB 跟隨、**4×VL53L0X（左前／正前／右前／正後）**、**特定人鎖定**、**網頁遙控／儀表板**合成一支程式（**暫不含 MaUWB AOA**）。
 
 ## 功能一覽
 
@@ -10,26 +10,28 @@
 | 特定人鎖定 | 網頁鎖中央／舉手 2 秒；HSV Re-ID 抗遮擋換 ID |
 | 跌倒偵測 | 只分析鎖定目標；約 10 秒確認；LINE 文字＋照片＋影片 |
 | 跌倒急停 | 確認 → `X`；可自動關跟隨 |
-| 底層避障／防墜 | 左前／正前／右前避障；**下視**防落差；**後方**限制自轉 |
+| 底層避障 | 左前／正前／右前避障；**正後**限制自轉 |
 | 網頁儀表板 | 手動遙控、UWB／ToF 即時顯示、跌倒警報橫幅 |
 
 網頁：`http://樹莓派IP:5001`
 
 ## 接線／供電／燒錄／Pi 指令（完整）
 
-請看 **[`DEPLOY.md`](DEPLOY.md)**（含供電規則、每根訊號線、要燒哪些 `.ino`、樹莓派 curl／venv 指令）。
+請看 **[`DEPLOY.md`](DEPLOY.md)**。  
+功能＋腳位總表：**[`FEATURES_PINOUT.txt`](FEATURES_PINOUT.txt)**。
 
 簡表：
 
 | 板子 | 燒錄檔 |
 |------|--------|
 | 車上 ESP32-UWB | `firmware/uwb_car_responder/uwb_car_responder.ino` |
-| Arduino UNO | `firmware/uno_car_vl53/uno_car_vl53.ino`（5×VL53） |
+| Arduino UNO | `firmware/uno_car_vl53/uno_car_vl53.ino`（4×VL53） |
 | 身上 Tag ESP32 | `uwb-follow-car` 的 `uwb_tag_initiator`（沿用） |
 | 樹莓派 | 不燒韌體；跑 `fall_follow_car.py` + `line_media.py` |
 
 ★ **UNO D11 → ESP32 GPIO16**（`O:` 回傳）  
-★ VL53：腳 **2/3/4/5/6** = 左前／正前／右前／**下視**／**後方**
+★ VL53：腳 **2/3/4/5** = 左前／正前／右前／**正後**  
+★ 邏輯電：**3S 18650 → DC → XY3606 → USB-C → Pi 5**
 
 ## 操作順序（建議）
 
@@ -41,7 +43,8 @@
 ## 檔案
 
 - `PROJECT_HANDBOOK.md` — 專題說明書
-- `專題問答.txt` — 口試／報告備稿（核心功能、應用、架構、限制）
+- `專題問答.txt` — 口試／報告備稿
+- `FEATURES_PINOUT.txt` — 功能＋腳位總表（核對用）
 - `DEPLOY.md` — 接線／供電／燒錄／Pi 指令
 - `web_preview/` — **網頁版面預覽**（靜態 HTML，不連 Pi）
 - `fall_follow_car.py` — 主程式

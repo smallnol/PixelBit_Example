@@ -3,7 +3,7 @@
 
 功能：
 1. YOLO-pose + ByteTrack：鎖定特定人跟隨／跌倒（路人不觸發）
-2. ESP32-UWB 距離 + 5×VL53L0X 避障遙測（O:）
+2. ESP32-UWB 距離 + 4×VL53L0X 避障遙測（O:）
 3. 確認跌倒 → 緊急煞停 X + LINE
 4. 網頁：跟隨／跌倒開關、鎖定目標、手動遙控、感測儀表板
 """
@@ -28,7 +28,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / '.env')
 import line_media as fall  # noqa: E402
 
-APP_VERSION = 'fall-follow-2026-11-23-vl53x5-cliff-rear'
+APP_VERSION = 'fall-follow-2026-11-25-vl53x4-rear'
 
 # --- 硬體 / 網路 ---
 CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
@@ -72,17 +72,16 @@ ENABLE_GESTURE_LOCK = os.getenv('ENABLE_GESTURE_LOCK', '1').strip() not in {'0',
 GESTURE_LOCK_SECONDS = float(os.getenv('GESTURE_LOCK_SECONDS', '2.0'))
 HSV_REID_THRESHOLD = float(os.getenv('HSV_REID_THRESHOLD', '0.55'))
 AVOID_MM = int(os.getenv('AVOID_MM', '250'))
-CLIFF_MM = int(os.getenv('CLIFF_MM', '150'))  # 下視大於此值＝疑似落差
 TRACKER_CFG = os.getenv('TRACKER_CFG', 'bytetrack.yaml').strip() or 'bytetrack.yaml'
 
 DIST_LINE_RE = re.compile(r'D:\s*([0-9]+(?:\.[0-9]+)?)', re.IGNORECASE)
 DIST_LEGACY_RE = re.compile(r'\[CAR\]\s*([0-9]+(?:\.[0-9]+)?)\s*m', re.IGNORECASE)
-# O:左前,正前,右前,下視,後方
+# O:左前,正前,右前,正後
 TOF_LINE_RE = re.compile(
-    r'O:\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)',
+    r'O:\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)',
     re.IGNORECASE,
 )
-TOF_LABELS = ('左前', '正前', '右前', '下視', '後方')
+TOF_LABELS = ('左前', '正前', '右前', '正後')
 
 app = Flask(__name__)
 
@@ -98,7 +97,7 @@ fall_alert_active = False
 fall_alert_ts = ''
 latest_distance: float | None = None
 last_distance_time = 0.0
-latest_tof_mm = [8190, 8190, 8190, 8190, 8190]
+latest_tof_mm = [8190, 8190, 8190, 8190]
 last_tof_time = 0.0
 latest_cmd = 'S'
 latest_status = '待機'
@@ -211,7 +210,7 @@ class SerialReader:
 
         m_tof = TOF_LINE_RE.search(line)
         if m_tof:
-          vals = [int(m_tof.group(i)) for i in range(1, 6)]
+          vals = [int(m_tof.group(i)) for i in range(1, 5)]
           with state_lock:
             latest_tof_mm = vals
             last_tof_time = time.time()
@@ -954,7 +953,7 @@ INDEX_HTML = """
     img.feed { width: 100%; background: #000; border-radius: 8px; display: block; }
     .pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; max-width: 240px; }
     .pad .spacer { visibility: hidden; }
-    .tof-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
+    .tof-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
     .tof {
       background: #111820; border-radius: 8px; padding: 8px 6px; text-align: center; border: 1px solid #2a3542;
     }
@@ -982,7 +981,7 @@ INDEX_HTML = """
       <button class="ghost" onclick="api('/api/clear_alert','POST')">解除警報狀態</button>
     </div>
     <h1>跌倒偵測 + 視覺跟隨（鎖定目標版）</h1>
-    <p class="sub">version {{ version }}｜UWB + 5×VL53L0X｜ByteTrack 特定人鎖定</p>
+    <p class="sub">version {{ version }}｜UWB + 4×VL53L0X｜ByteTrack 特定人鎖定</p>
 
     <div class="grid">
       <section class="card">
@@ -1024,7 +1023,7 @@ INDEX_HTML = """
         </section>
 
         <section class="card">
-          <h2>VL53L0X（mm）前三避障／下視防墜／後方</h2>
+          <h2>VL53L0X（mm）左前／正前／右前／正後</h2>
           <div class="tof-grid" id="tofGrid"></div>
           <div class="sub" id="tofAge" style="margin-top:8px">ToF age: --</div>
         </section>
@@ -1032,13 +1031,12 @@ INDEX_HTML = """
     </div>
 
     <p class="hint">
-      置中死區 ±{{ deadzone }}｜前進 ≥ {{ start }}m｜停止 &lt; {{ stop }}m｜跌倒確認 {{ confirm }}s｜靈敏度 {{ sens }}｜避障 {{ avoid }}mm｜防墜 &gt;{{ cliff }}mm<br/>
+      置中死區 ±{{ deadzone }}｜前進 ≥ {{ start }}m｜停止 &lt; {{ stop }}m｜跌倒確認 {{ confirm }}s｜靈敏度 {{ sens }}｜避障 {{ avoid }}mm<br/>
       UWB/Motor: {{ uwb }}｜手勢鎖定: {{ gesture }}｜{{ version }}
     </p>
   </main>
   <script>
     const AVOID = {{ avoid }};
-    const CLIFF = {{ cliff }};
     const LABELS = {{ labels_json }};
     let holdTimer = null;
     let following = false;
@@ -1080,13 +1078,9 @@ INDEX_HTML = """
     function renderTof(vals, age) {
       const root = document.getElementById('tofGrid');
       root.innerHTML = '';
-      (vals || [8190,8190,8190,8190,8190]).forEach((v, i) => {
-        // 前三＋後方：太近危險；下視：距離太大＝落差危險
-        const isDown = i === 3;
-        const danger = isDown ? (v >= CLIFF) : (v < AVOID);
-        const pct = isDown
-          ? Math.max(0, Math.min(100, 100 - (v / 500) * 100))
-          : Math.max(0, Math.min(100, (v / 1000) * 100));
+      (vals || [8190,8190,8190,8190]).forEach((v, i) => {
+        const danger = v < AVOID;
+        const pct = Math.max(0, Math.min(100, (v / 1000) * 100));
         const div = document.createElement('div');
         div.className = 'tof' + (danger ? ' danger' : '');
         div.innerHTML = `<div class="l">${LABELS[i]}</div>
@@ -1159,7 +1153,6 @@ def index():
       confirm=fall.FALL_CONFIRM_SECONDS,
       sens=fall.FALL_SENSITIVITY,
       avoid=AVOID_MM,
-      cliff=CLIFF_MM,
       uwb=UWB_SERIAL_PORT,
       gesture='ON' if ENABLE_GESTURE_LOCK else 'OFF',
       version=APP_VERSION,
@@ -1305,7 +1298,6 @@ def status():
             'tof_age': tof_age,
             'tof_labels': list(TOF_LABELS),
             'avoid_mm': AVOID_MM,
-            'cliff_mm': CLIFF_MM,
             'person_seen': person_seen,
             'offset': person_offset,
             'locked_target_id': locked_target_id,

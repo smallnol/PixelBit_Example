@@ -1,17 +1,16 @@
 /*
- * UNO R3 + BMP73T104 + 5×VL53L0X｜Pi-slave 馬達 + 避障／防墜
+ * UNO R3 + BMP73T104 + 4×VL53L0X｜Pi-slave 馬達 + 避障
  *
  * 接線：
  *   ESP32 GPIO17 (TX2) → UNO D10（SoftwareSerial RX，收 F/L/R/Z/S/X）
  *   UNO D11 (SoftSerial TX) → ESP32 GPIO16（回傳 O:mm,...）
  *   GND 共地
  *
- * VL53L0X XSHUT（共用 I2C SDA/SCL）：
- *   [0]左前       D2 → addr 0x30
- *   [1]正前       D3 → addr 0x31
- *   [2]右前       D4 → addr 0x32
- *   [3]前端下視   D5 → addr 0x33  （朝地面；距離變大＝落差 → 強制停）
- *   [4]後方       D6 → addr 0x34  （水平朝後；過近時限制自轉搜尋）
+ * VL53L0X XSHUT（共用 I2C SDA/SCL/VCC/GND）：
+ *   [0]左前   D2 → addr 0x30
+ *   [1]正前   D3 → addr 0x31
+ *   [2]右前   D4 → addr 0x32
+ *   [3]正後   D5 → addr 0x33  （水平朝後；自轉過近強制停）
  *
  * 庫：Wire、BMP73T104、SoftwareSerial、Pololu VL53L0X
  * USB 監看：115200
@@ -30,9 +29,8 @@ const unsigned long CMD_REFRESH_MS = 250;
 const unsigned long TOF_TELEM_MS = 200;
 const unsigned long SOFT_RAMP_MS = 40;
 
-// --- 避障／防墜 ---
-const uint16_t AVOID_MM = 250;          // 前方障礙：小於此值要躲／停
-const uint16_t CLIFF_MM = 150;          // 下視：大於此值視為無地板（樓梯／落差）
+// --- 避障 ---
+const uint16_t AVOID_MM = 250;          // 過近：小於此值要躲／停
 const uint16_t TOF_FAIL_MM = 8190;      // 超量程／失敗
 
 // --- 馬達（弧線轉，降低 OCP）---
@@ -79,15 +77,15 @@ int tgtLeft = 0;
 int tgtRight = 0;
 bool emergencyHold = false;
 
-// --- VL53L0X（5 顆）---
-const uint8_t NUM_TOF = 5;
-const uint8_t XSHUT_PINS[NUM_TOF] = {2, 3, 4, 5, 6};       // D2~D6
-const uint8_t TOF_ADDR[NUM_TOF] = {0x30, 0x31, 0x32, 0x33, 0x34};
+// --- VL53L0X（4 顆：左前／正前／右前／正後）---
+const uint8_t NUM_TOF = 4;
+const uint8_t XSHUT_PINS[NUM_TOF] = {2, 3, 4, 5};          // D2~D5
+const uint8_t TOF_ADDR[NUM_TOF] = {0x30, 0x31, 0x32, 0x33};
 VL53L0X tof[NUM_TOF];
 uint16_t tofMm[NUM_TOF] = {
-    TOF_FAIL_MM, TOF_FAIL_MM, TOF_FAIL_MM, TOF_FAIL_MM, TOF_FAIL_MM
+    TOF_FAIL_MM, TOF_FAIL_MM, TOF_FAIL_MM, TOF_FAIL_MM
 };
-bool tofOk[NUM_TOF] = {false, false, false, false, false};
+bool tofOk[NUM_TOF] = {false, false, false, false};
 
 void setSingleMotorSafe(BMP73T104 &motor, int rawSpeed, float trim, int dir) {
   int targetSpeed = constrain((int)(rawSpeed * trim * dir), -100, 100);
@@ -170,11 +168,9 @@ void softApplyTargets(bool force) {
   lastRampTime = now;
 
   int step = 18;
-  // 轉向／自轉用更小步階
   if (activeCmd == CMD_LEFT || activeCmd == CMD_RIGHT || activeCmd == CMD_SPIN) {
     step = 12;
   }
-  // 方向相反時先快速收到 0 再加速，降低對拉電流
   if ((curLeft > 0 && tgtLeft < 0) || (curLeft < 0 && tgtLeft > 0)) {
     tgtLeft = 0;
   }
@@ -211,7 +207,6 @@ void setActiveCommand(char cmd, bool force) {
   activeCmd = cmd;
   cmdToTargets(cmd, tgtLeft, tgtRight);
   if (cmd == CMD_STOP) {
-    // 軟停：目標歸零，由 softApply 緩降
     softApplyTargets(true);
   } else if (force) {
     softApplyTargets(true);
@@ -238,7 +233,7 @@ void pollTof() {
 }
 
 void sendTofTelemetry() {
-  // O:左前,正前,右前,下視,後方
+  // O:左前,正前,右前,正後
   piSerial.print(F("O:"));
   for (uint8_t i = 0; i < NUM_TOF; i++) {
     if (i) piSerial.print(',');
@@ -254,26 +249,12 @@ void sendTofTelemetry() {
   Serial.println();
 }
 
-bool cliffDetected() {
-  // 前端下視朝地面：正常可見地板（距離較小）；
-  // 臨樓梯／落差時距離突然變大或超量程 → 防墜煞
-  if (!tofOk[3]) return false;
-  uint16_t down = tofMm[3];
-  return (down >= CLIFF_MM) || (down >= 8000);
-}
-
 char applyObstacleOverride(char cmd) {
-  // X 最高優先，不受避障／防墜覆寫
+  // X 最高優先，不受避障覆寫
   if (cmd == CMD_BRAKE) return CMD_BRAKE;
 
-  // 防墜：任何移動指令（F/L/R/Z）遇到懸空 → 強制停
-  if (cmd != CMD_STOP && cliffDetected()) {
-    Serial.println(F("CLIFF: drop-off -> S"));
-    return CMD_STOP;
-  }
-
-  // 後方過近：自轉搜尋 Z 時強制停
-  if (cmd == CMD_SPIN && tofOk[4] && tofMm[4] < AVOID_MM) {
+  // 正後過近：自轉搜尋 Z 時強制停
+  if (cmd == CMD_SPIN && tofOk[3] && tofMm[3] < AVOID_MM) {
     Serial.println(F("AVOID: rear blocked -> S"));
     return CMD_STOP;
   }
@@ -293,7 +274,6 @@ char applyObstacleOverride(char cmd) {
     return CMD_STOP;
   }
 
-  // 用左前／右前開闊度決定微偏
   if (fl > fr + 30) {
     Serial.println(F("AVOID: steer L"));
     return CMD_LEFT;
@@ -348,7 +328,6 @@ void pollPiCommands() {
 }
 
 bool initTofSensors() {
-  // 全部 XSHUT 拉低休眠
   for (uint8_t i = 0; i < NUM_TOF; i++) {
     pinMode(XSHUT_PINS[i], OUTPUT);
     digitalWrite(XSHUT_PINS[i], LOW);
@@ -364,7 +343,6 @@ bool initTofSensors() {
       Serial.print(F("VL53 init FAIL idx="));
       Serial.println(i);
       tofOk[i] = false;
-      // 失敗也維持 HIGH，避免其他感測器位址衝突時被誤喚醒到 0x29
       continue;
     }
     tof[i].setAddress(TOF_ADDR[i]);
@@ -399,11 +377,11 @@ void setup() {
   requestedCmd = CMD_STOP;
   lastCmdTime = millis();
 
-  Serial.println(F("=== UNO Pi-slave + 5xVL53 避障/防墜 ==="));
+  Serial.println(F("=== UNO Pi-slave + 4xVL53 避障 ==="));
   if (!initTofSensors()) {
     Serial.println(F("警告：VL53 全部失敗，避障停用（馬達命令仍可用）"));
   }
-  Serial.println(F("命令 F/L/R/Z/S/X｜O:5｜AVOID 250mm｜CLIFF 150mm"));
+  Serial.println(F("命令 F/L/R/Z/S/X｜O:4｜AVOID 250mm｜rear on Z"));
 }
 
 void loop() {
@@ -412,7 +390,7 @@ void loop() {
   pollPiCommands();
   pollTof();
 
-  // 持續用最新 ToF 覆寫（前進避障／任何移動防墜）
+  // 持續用最新 ToF 覆寫（前進避障／自轉後方）
   if (!emergencyHold &&
       (requestedCmd == CMD_FORWARD || requestedCmd == CMD_LEFT ||
        requestedCmd == CMD_RIGHT || requestedCmd == CMD_SPIN)) {
@@ -427,7 +405,6 @@ void loop() {
     sendTofTelemetry();
   }
 
-  // 逾時無命令 → 急停
   if (activeCmd != CMD_STOP && activeCmd != CMD_BRAKE &&
       (millis() - lastCmdTime > CMD_TIMEOUT_MS)) {
     Serial.println(F("Pi 命令逾時 -> 緊急煞停"));
@@ -436,7 +413,6 @@ void loop() {
     requestedCmd = CMD_STOP;
   }
 
-  // Soft-start 斜坡 + 定期重送
   if (!emergencyHold) {
     softApplyTargets(false);
   }
