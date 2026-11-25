@@ -28,7 +28,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / '.env')
 import line_media as fall  # noqa: E402
 
-APP_VERSION = 'fall-follow-2026-11-25-follow-recovery'
+APP_VERSION = 'fall-follow-2026-11-25-nocam-telemetry'
 
 # --- 硬體 / 網路 ---
 CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
@@ -140,8 +140,52 @@ follow_recovery_note = ''
 print('正在載入 YOLO-pose...')
 model = YOLO('yolov8n-pose.pt')
 cap = cv2.VideoCapture(CAMERA_INDEX)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+if cap.isOpened():
+  cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+  cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+  # 縮短取像等待，避免沒鏡頭／壞裝置時卡住整支程式
+  try:
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+  except Exception:
+    pass
+  print(f'✅ 相機已開啟 index={CAMERA_INDEX}', flush=True)
+else:
+  print(
+      f'⚠️ 相機無法開啟 index={CAMERA_INDEX}：'
+      f'網頁仍顯示 UWB／ToF；跟隨／跌倒需接回鏡頭',
+      flush=True,
+  )
+
+
+def _placeholder_frame(msg: str = 'NO CAMERA') -> np.ndarray:
+  frame = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
+  cv2.putText(
+      frame, msg, (20, FRAME_HEIGHT // 2),
+      cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA,
+  )
+  with state_lock:
+    dist = latest_distance
+    tof = list(latest_tof_mm)
+    cmd = latest_cmd
+  y = 40
+  cv2.putText(
+      frame, f'UWB: {dist if dist is not None else "--"} m  CMD: {cmd}',
+      (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA,
+  )
+  y += 28
+  cv2.putText(
+      frame, 'ToF: ' + ','.join(str(v) for v in tof),
+      (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 255, 200), 1, cv2.LINE_AA,
+  )
+  return frame
+
+
+def _publish_jpeg(frame: np.ndarray) -> None:
+  global latest_jpeg
+  ok_jpg, jpg_buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+  if ok_jpg:
+    with jpeg_lock:
+      latest_jpeg = jpg_buf.tobytes()
 
 
 class SerialReader:
@@ -234,6 +278,11 @@ class SerialReader:
           with state_lock:
             latest_tof_mm = vals
             last_tof_time = time.time()
+          if not hasattr(self, '_tof_log_n'):
+            self._tof_log_n = 0
+          self._tof_log_n += 1
+          if self._tof_log_n <= 5 or self._tof_log_n % 25 == 0:
+            print(f'📥 O: {vals}', flush=True)
           continue
 
         m = DIST_LINE_RE.search(line) or DIST_LEGACY_RE.search(line)
@@ -244,6 +293,11 @@ class SerialReader:
           with state_lock:
             latest_distance = dist
             last_distance_time = time.time()
+          if not hasattr(self, '_dist_log_n'):
+            self._dist_log_n = 0
+          self._dist_log_n += 1
+          if self._dist_log_n <= 5 or self._dist_log_n % 25 == 0:
+            print(f'📥 D: {dist:.2f}', flush=True)
       except Exception as e:
         self.ok = False
         self.last_error = str(e)
@@ -970,16 +1024,57 @@ def control_loop() -> None:
   global manual_cmd, manual_cmd_until
 
   print('=== CONTROL LOOP THREAD ENTER ===', flush=True)
-  if not cap.isOpened():
-    print('=== CAMERA NOT OPEN — control loop exit ===', flush=True)
-    return
-
-  print('=== CONTROL LOOP RUNNING (follow + fall + lock + tof) ===', flush=True)
+  camera_ok = bool(cap is not None and cap.isOpened())
+  if not camera_ok:
+    print(
+        '=== CONTROL LOOP RUNNING (NO CAMERA: telemetry + manual only) ===',
+        flush=True,
+    )
+  else:
+    print('=== CONTROL LOOP RUNNING (follow + fall + lock + tof) ===', flush=True)
   frame_interval = 1.0 / fall.CLIP_FPS
 
   while not control_stop.is_set():
+    # 無相機：仍刷新佔位畫面與手動／急停，讓網頁 UWB／ToF 可看
+    if not camera_ok:
+      now = time.time()
+      with state_lock:
+        following = is_following
+        man_cmd = manual_cmd
+        man_until = manual_cmd_until
+        distance = latest_distance
+        dist_age = now - last_distance_time if last_distance_time else 999.0
+        tof_snapshot = list(latest_tof_mm)
+        tof_age = now - last_tof_time if last_tof_time else 999.0
+
+      cmd, status = 'S', 'no camera: follow vision disabled'
+      next_forward = False
+      if man_cmd and now <= man_until:
+        cmd, status, next_forward = man_cmd, f'manual {man_cmd}', man_cmd == 'F'
+      elif following:
+        status = 'no camera: auto-follow paused (UWB/ToF live)'
+
+      # 無相機時仍套用 ToF 防護（手動前進不會硬撞）
+      if cmd in {'F', 'L', 'R', 'Z'}:
+        guarded, gnote = _apply_tof_motion_guard(cmd, tof_snapshot, tof_age)
+        if gnote:
+          status = f'{status} | {gnote}'
+        cmd = guarded
+
+      motor.send(cmd, force=True)
+      with state_lock:
+        latest_cmd = cmd
+        latest_status = status
+        person_seen = False
+        was_forward = next_forward
+        fall_status = 'fall: need camera'
+      _publish_jpeg(_placeholder_frame('NO CAMERA — UWB/ToF only'))
+      time.sleep(0.15)
+      continue
+
     ok, frame = cap.read()
     if not ok:
+      _publish_jpeg(_placeholder_frame('CAMERA READ FAIL'))
       time.sleep(0.05)
       continue
 
@@ -1130,8 +1225,15 @@ def generate_frames():
     with jpeg_lock:
       frame = latest_jpeg
     if frame is None:
-      time.sleep(0.05)
-      continue
+      ok_jpg, jpg_buf = cv2.imencode(
+          '.jpg',
+          _placeholder_frame('WAITING'),
+          [int(cv2.IMWRITE_JPEG_QUALITY), 60],
+      )
+      frame = jpg_buf.tobytes() if ok_jpg else None
+      if frame is None:
+        time.sleep(0.1)
+        continue
     yield (
         b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame + b'\r\n'
     )
@@ -1321,7 +1423,9 @@ INDEX_HTML = """
     }
 
     async function refresh() {
+      try {
       const r = await fetch('/api/status');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
       const j = await r.json();
       setManualEnabled(!!j.following);
 
@@ -1362,6 +1466,10 @@ INDEX_HTML = """
         `跟隨狀態: ${j.status}\\n` +
         `復原: ${j.recovery || '-'}\\n` +
         `跌倒狀態: ${fallLine}`;
+      } catch (e) {
+        document.getElementById('status').textContent =
+          '狀態更新失敗: ' + e + '\\n請確認程式仍在執行，並硬重新整理頁面';
+      }
     }
 
     refresh();
