@@ -27,7 +27,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / '.env')
 import line_media as fall  # noqa: E402
 
-APP_VERSION = 'fall-follow-2026-11-25-ui-clean'
+APP_VERSION = 'fall-follow-2026-11-25-ui-line'
 
 # --- 硬體 / 網路 ---
 CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
@@ -36,6 +36,8 @@ PORT = int(os.getenv('PORT', '5001'))
 
 UWB_SERIAL_PORT = os.getenv('UWB_SERIAL_PORT', '/dev/ttyUSB0').strip()
 UWB_BAUD = int(os.getenv('UWB_BAUD', '115200'))
+# LINE 官方帳號加入連結（例：https://line.me/R/ti/p/@xxxx）
+LINE_OA_URL = os.getenv('LINE_OA_URL', '').strip()
 
 _motor_port_raw = os.getenv('MOTOR_SERIAL_PORT', 'uwb').strip()
 _pi5_trap = {'/dev/serial0', '/dev/ttyama0', '/dev/ttyama10', 'serial0', 'ttyama0'}
@@ -1237,6 +1239,14 @@ INDEX_HTML = """
     .warn { background: var(--warn); }
     .ghost { background: #334155; }
     .accent { background: var(--accent); }
+    .line-btn {
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+      width: 100%; text-decoration: none; color: #fff; font-weight: 700;
+      background: #06C755; border-radius: 12px; padding: 12px 14px;
+      transition: filter .12s ease, transform .12s ease;
+    }
+    .line-btn:hover { filter: brightness(1.06); }
+    .line-btn:active { transform: scale(.98); }
     .feed-wrap {
       position: relative; border-radius: 14px; overflow: hidden;
       border: 1px solid var(--line); background: #000; aspect-ratio: 4/3;
@@ -1334,16 +1344,27 @@ INDEX_HTML = """
         </section>
 
         <section class="card">
-          <h2>距離（UWB）</h2>
+          <h2>距離</h2>
           <div class="metric-big" id="uwbBox">--</div>
           <div class="metric-sub" id="uwbAge">尚無資料</div>
         </section>
 
         <section class="card">
-          <h2>正前障礙（VL53）</h2>
+          <h2>正前障礙</h2>
           <div class="metric-big" id="tofVal">--</div>
           <div class="metric-sub" id="tofAge">單位 mm</div>
           <div class="meter" id="tofMeter"><span id="tofBar"></span></div>
+        </section>
+
+        <section class="card">
+          <h2>LINE 通知</h2>
+          <p class="metric-sub" style="margin:0 0 12px">加入官方帳號，跌倒確認時即時收到文字、照片與影片</p>
+          {% if line_oa_url %}
+          <a class="line-btn" href="{{ line_oa_url }}" target="_blank" rel="noopener noreferrer">加入 LINE 官方帳號</a>
+          {% else %}
+          <button class="ghost" type="button" disabled title="請在 .env 設定 LINE_OA_URL">尚未設定加入連結</button>
+          <p class="metric-sub" style="margin-top:8px">在 .env 填入 LINE_OA_URL=https://line.me/R/ti/p/@你的帳號</p>
+          {% endif %}
         </section>
       </aside>
     </div>
@@ -1452,7 +1473,7 @@ INDEX_HTML = """
           ? (j.person_seen ? '鎖定目標在畫面中' : '尋找目標中')
           : '未鎖定';
         const linkOk = !!j.uwb_ok && !!j.motor_ok;
-        document.getElementById('statLink').textContent = linkOk ? 'UWB / 馬達正常' : '連線異常，請檢查 USB';
+        document.getElementById('statLink').textContent = linkOk ? '感測 / 馬達正常' : '連線異常，請檢查 USB';
         document.getElementById('statusMsg').textContent = humanMsg(j);
 
         const dist = j.distance;
@@ -1503,6 +1524,7 @@ def index():
       uwb=UWB_SERIAL_PORT,
       gesture='ON' if ENABLE_GESTURE_LOCK else 'OFF',
       version=APP_VERSION,
+      line_oa_url=LINE_OA_URL,
   )
 
 
