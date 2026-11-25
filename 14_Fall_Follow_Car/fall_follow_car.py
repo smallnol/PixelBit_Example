@@ -3,9 +3,9 @@
 
 功能：
 1. YOLO-pose + ByteTrack：鎖定特定人跟隨／跌倒（路人不觸發）
-2. ESP32-UWB 距離（VL53／O: 避障已停用，見 DEPLOY.md）
+2. ESP32-UWB 距離 + 1×VL53L0X 正前避障（O:mm）
 3. 確認跌倒 → 緊急煞停 X + LINE
-4. 網頁：跟隨／跌倒開關、鎖定目標、手動遙控、UWB 儀表板
+4. 網頁：跟隨／跌倒開關、鎖定目標、手動遙控、UWB／正前 ToF
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / '.env')
 import line_media as fall  # noqa: E402
 
-APP_VERSION = 'fall-follow-2026-11-25-no-vl53'
+APP_VERSION = 'fall-follow-2026-11-25-vl53-front'
 
 # --- 硬體 / 網路 ---
 CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
@@ -61,6 +61,7 @@ START_DIST = float(os.getenv('START_DIST', '2.0'))
 STOP_DIST = float(os.getenv('STOP_DIST', '1.8'))
 CENTER_DEADZONE = float(os.getenv('CENTER_DEADZONE', '0.12'))
 UWB_STALE_SECONDS = float(os.getenv('UWB_STALE_SECONDS', '1.0'))
+TOF_STALE_SECONDS = float(os.getenv('TOF_STALE_SECONDS', '1.0'))
 CMD_INTERVAL_SECONDS = float(os.getenv('CMD_INTERVAL_SECONDS', '0.15'))
 CMD_HEARTBEAT_SECONDS = float(os.getenv('CMD_HEARTBEAT_SECONDS', '0.8'))
 FRAME_WIDTH = int(os.getenv('FRAME_WIDTH', str(fall.FRAME_WIDTH)))
@@ -77,10 +78,14 @@ SEARCH_BIAS_SECONDS = float(os.getenv('SEARCH_BIAS_SECONDS', '3.0'))
 Z_TIMEOUT_SECONDS = float(os.getenv('Z_TIMEOUT_SECONDS', '12.0'))
 STUCK_SECONDS = float(os.getenv('STUCK_SECONDS', '4.0'))
 STUCK_DIST_EPS = float(os.getenv('STUCK_DIST_EPS', '0.15'))
+AVOID_MM = int(os.getenv('AVOID_MM', '250'))
 TRACKER_CFG = os.getenv('TRACKER_CFG', 'bytetrack.yaml').strip() or 'bytetrack.yaml'
 
 DIST_LINE_RE = re.compile(r'D:\s*([0-9]+(?:\.[0-9]+)?)', re.IGNORECASE)
 DIST_LEGACY_RE = re.compile(r'\[CAR\]\s*([0-9]+(?:\.[0-9]+)?)\s*m', re.IGNORECASE)
+# 單顆正前：O:320 ；相容舊四顆格式時取第 2 欄（正前）
+TOF_LINE_RE = re.compile(r'O:\s*(\d+)(?:\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+))?', re.IGNORECASE)
+TOF_LABEL = '正前'
 
 app = Flask(__name__)
 
@@ -96,6 +101,8 @@ fall_alert_active = False
 fall_alert_ts = ''
 latest_distance: float | None = None
 last_distance_time = 0.0
+latest_tof_mm = 8190
+last_tof_time = 0.0
 latest_cmd = 'S'
 latest_status = '待機'
 person_offset = 0.0
@@ -114,7 +121,7 @@ gesture_raise_since: dict[int, float] = {}
 manual_cmd: str | None = None
 manual_cmd_until = 0.0
 
-# --- 跟隨復原狀態（無 VL53；靠 UWB + 視覺）---
+# --- 跟隨復原／正前避障狀態 ---
 last_seen_offset = 0.0
 target_lost_since: float | None = None
 search_spin_since: float | None = None
@@ -138,7 +145,7 @@ if cap.isOpened():
 else:
   print(
       f'⚠️ 相機無法開啟 index={CAMERA_INDEX}：'
-      f'網頁仍顯示 UWB；跟隨／跌倒需接回鏡頭',
+      f'網頁仍顯示 UWB／正前 ToF；跟隨／跌倒需接回鏡頭',
       flush=True,
   )
 
@@ -151,11 +158,17 @@ def _placeholder_frame(msg: str = 'NO CAMERA') -> np.ndarray:
   )
   with state_lock:
     dist = latest_distance
+    tof = latest_tof_mm
     cmd = latest_cmd
   y = 40
   cv2.putText(
       frame, f'UWB: {dist if dist is not None else "--"} m  CMD: {cmd}',
       (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA,
+  )
+  y += 28
+  cv2.putText(
+      frame, f'ToF front: {tof} mm',
+      (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 255, 200), 1, cv2.LINE_AA,
   )
   return frame
 
@@ -169,7 +182,7 @@ def _publish_jpeg(frame: np.ndarray) -> None:
 
 
 class SerialReader:
-  """背景讀取 UWB 距離；可與馬達命令共用同一 USB 口。（VL53/O: 已停用）"""
+  """背景讀取 UWB 距離與正前 VL53 O:；可與馬達命令共用同一 USB 口。"""
 
   def __init__(self, port: str, baud: int):
     self.port = port
@@ -230,7 +243,7 @@ class SerialReader:
         return False
 
   def _run(self) -> None:
-    global latest_distance, last_distance_time
+    global latest_distance, last_distance_time, latest_tof_mm, last_tof_time
     while not self._stop.is_set():
       with self._io_lock:
         need_open = self._ser is None or not self._ser.is_open
@@ -251,6 +264,23 @@ class SerialReader:
           continue
         if 'FWD' in line.upper() or line.upper().startswith('CMD'):
           print(f'📥 ESP32: {line}', flush=True)
+
+        m_tof = TOF_LINE_RE.search(line)
+        if m_tof:
+          # 單顆 O:mm；若舊四顆格式則取正前（第 2 欄）
+          if m_tof.group(2) is not None:
+            val = int(m_tof.group(2))
+          else:
+            val = int(m_tof.group(1))
+          with state_lock:
+            latest_tof_mm = val
+            last_tof_time = time.time()
+          if not hasattr(self, '_tof_log_n'):
+            self._tof_log_n = 0
+          self._tof_log_n += 1
+          if self._tof_log_n <= 5 or self._tof_log_n % 25 == 0:
+            print(f'📥 O front: {val}', flush=True)
+          continue
 
         m = DIST_LINE_RE.search(line) or DIST_LEGACY_RE.search(line)
         if not m:
@@ -535,9 +565,22 @@ def resolve_locked_target(people: list[dict], frame: np.ndarray) -> tuple[dict |
   return None, f'locked id={locked_target_id} LOST'
 
 
+def _tof_fresh(tof_age: float) -> bool:
+  return tof_age <= TOF_STALE_SECONDS
+
+
+def _apply_front_tof_guard(cmd: str, tof_mm: int, tof_age: float) -> tuple[str, str]:
+  """僅正前：前進過近則停。無側／後方感測。"""
+  if cmd != 'F' or not _tof_fresh(tof_age):
+    return cmd, ''
+  if int(tof_mm) < AVOID_MM:
+    return 'S', f'tof: front {tof_mm}mm < {AVOID_MM} -> S'
+  return cmd, ''
+
+
 def _recover_when_target_lost(now: float) -> tuple[str, str, bool]:
   """目標短暫消失／轉角／遮擋：寬限 → 依最後方位搜 → 自轉 → 逾時停止。
-  （VL53 停用：無側牆／後方 ToF 覆寫）"""
+  （僅正前 VL53；搜尋 L/R/Z 不做側／後覆寫）"""
   global target_lost_since, search_spin_since, search_exhausted, follow_recovery_note
 
   if target_lost_since is None:
@@ -565,7 +608,7 @@ def _recover_when_target_lost(now: float) -> tuple[str, str, bool]:
       follow_recovery_note = 'search bias R (last offset)'
       return 'R', follow_recovery_note, False
 
-  # 全域自轉；逾時停止（無 AOA／無 VL53 後方防護）
+  # 全域自轉；逾時停止（無 AOA；單顆無後方防護）
   if search_spin_since is None:
     search_spin_since = now
   spun = now - search_spin_since
@@ -587,7 +630,7 @@ def _stuck_recover(
 ) -> tuple[str, str]:
   """
   情境5：無碰觸開關時，用「一直 F 但 UWB 距離沒拉近」推估卡住／細障。
-  VL53 停用：卡住時直接停（無側向空檔判斷）。
+  單顆正前無側向空檔 → 卡住直接停。
   """
   global stuck_forward_since, stuck_dist_ref, follow_recovery_note
 
@@ -625,6 +668,8 @@ def decide_command(
     prev_forward: bool,
     fall_emergency: bool = False,
     need_lock: bool = False,
+    tof_mm: int = 8190,
+    tof_age: float = 999.0,
     now: float | None = None,
 ) -> tuple[str, str, bool]:
   global last_seen_offset, target_lost_since, search_spin_since
@@ -680,7 +725,16 @@ def decide_command(
     else:
       cmd, status, nxt = 'S', f'centered band {distance:.2f}m -> keep S', False
 
-  # 情境5：前進卡住推估（無 VL53 側向）
+  # 正前 ToF：前進過近則停
+  guarded, gnote = _apply_front_tof_guard(cmd, tof_mm, tof_age)
+  if gnote:
+    status = f'{status} | {gnote}'
+    follow_recovery_note = gnote
+  cmd = guarded
+  if cmd != 'F':
+    nxt = False if cmd in {'S', 'X', 'Z'} else prev_forward
+
+  # 情境5：前進卡住推估（單顆無側向）
   stuck_cmd, snote = _stuck_recover(cmd, distance, dist_ok, now)
   if snote:
     status = f'{status} | {snote}'
@@ -861,6 +915,7 @@ def draw_hud(
     detecting: bool,
     fall_txt: str,
     lock_txt: str,
+    tof_mm: int = 8190,
 ):
   h, w = frame.shape[:2]
   cx = w // 2
@@ -878,6 +933,7 @@ def draw_hud(
   lines = [
       f'FOLLOW: {"ON" if following else "OFF"}  FALL: {"ON" if detecting else "OFF"}  CMD: {cmd}',
       dist_txt,
+      f'ToF front: {tof_mm} mm',
       lock_txt[:52],
       f'offset: {offset:+.2f}' if has_person else 'target: none',
       status[:52],
@@ -909,11 +965,11 @@ def control_loop() -> None:
         flush=True,
     )
   else:
-    print('=== CONTROL LOOP RUNNING (follow + fall + lock) ===', flush=True)
+    print('=== CONTROL LOOP RUNNING (follow + fall + lock + front ToF) ===', flush=True)
   frame_interval = 1.0 / fall.CLIP_FPS
 
   while not control_stop.is_set():
-    # 無相機：仍刷新佔位畫面與手動／急停，讓網頁 UWB 可看
+    # 無相機：仍刷新佔位畫面與手動／急停，讓網頁 UWB／ToF 可看
     if not camera_ok:
       now = time.time()
       with state_lock:
@@ -922,13 +978,21 @@ def control_loop() -> None:
         man_until = manual_cmd_until
         distance = latest_distance
         dist_age = now - last_distance_time if last_distance_time else 999.0
+        tof_snapshot = latest_tof_mm
+        tof_age = now - last_tof_time if last_tof_time else 999.0
 
       cmd, status = 'S', 'no camera: follow vision disabled'
       next_forward = False
       if man_cmd and now <= man_until:
         cmd, status, next_forward = man_cmd, f'manual {man_cmd}', man_cmd == 'F'
       elif following:
-        status = 'no camera: auto-follow paused (UWB live)'
+        status = 'no camera: auto-follow paused (UWB/ToF live)'
+
+      if cmd == 'F':
+        guarded, gnote = _apply_front_tof_guard(cmd, tof_snapshot, tof_age)
+        if gnote:
+          status = f'{status} | {gnote}'
+        cmd = guarded
 
       motor.send(cmd, force=(cmd == 'X'))
       with state_lock:
@@ -937,7 +1001,7 @@ def control_loop() -> None:
         person_seen = False
         was_forward = next_forward
         fall_status = 'fall: need camera'
-      _publish_jpeg(_placeholder_frame('NO CAMERA — UWB only'))
+      _publish_jpeg(_placeholder_frame('NO CAMERA — UWB/ToF'))
       time.sleep(0.2)
       continue
 
@@ -996,6 +1060,8 @@ def control_loop() -> None:
         distance = latest_distance
         dist_age = time.time() - last_distance_time if last_distance_time else 999.0
         prev_forward = was_forward
+        tof_snapshot = latest_tof_mm
+        tof_age = time.time() - last_tof_time if last_tof_time else 999.0
         man_cmd = manual_cmd
         man_until = manual_cmd_until
         locked = locked_target_id
@@ -1022,6 +1088,8 @@ def control_loop() -> None:
           prev_forward,
           fall_emergency=fall_emergency,
           need_lock=need_lock,
+          tof_mm=tof_snapshot,
+          tof_age=tof_age,
           now=now,
       )
 
@@ -1035,6 +1103,13 @@ def control_loop() -> None:
         with state_lock:
           if manual_cmd == man_cmd:
             manual_cmd = None
+
+      if cmd == 'F':
+        guarded, gnote = _apply_front_tof_guard(cmd, tof_snapshot, tof_age)
+        if gnote:
+          status = f'{status} | {gnote}'
+          cmd = guarded
+          next_forward = False
 
       if fall_emergency:
         motor.send('X', force=True)
@@ -1074,6 +1149,7 @@ def control_loop() -> None:
           detecting,
           f_status,
           lock_txt,
+          tof_snapshot,
       )
       ret, jpg = cv2.imencode('.jpg', hud)
       if ret:
@@ -1175,7 +1251,7 @@ INDEX_HTML = """
       <button class="ghost" onclick="api('/api/clear_alert','POST')">解除警報狀態</button>
     </div>
     <h1>跌倒偵測 + 視覺跟隨（鎖定目標版）</h1>
-    <p class="sub">version {{ version }}｜UWB｜ByteTrack 特定人鎖定｜VL53 已停用</p>
+    <p class="sub">version {{ version }}｜UWB + 1×VL53 正前｜ByteTrack 特定人鎖定</p>
 
     <div class="grid">
       <section class="card">
@@ -1216,17 +1292,40 @@ INDEX_HTML = """
           <div class="sub" id="uwbAge">freshness: --</div>
         </section>
 
+        <section class="card">
+          <h2>VL53L0X 正前（mm）</h2>
+          <div class="tof-grid" style="grid-template-columns:1fr" id="tofGrid"></div>
+          <div class="sub" id="tofAge" style="margin-top:8px">ToF age: --</div>
+        </section>
       </aside>
     </div>
 
     <p class="hint">
-      置中死區 ±{{ deadzone }}｜前進 ≥ {{ start }}m｜停止 &lt; {{ stop }}m｜跌倒確認 {{ confirm }}s｜靈敏度 {{ sens }}｜VL53 已停用<br/>
+      置中死區 ±{{ deadzone }}｜前進 ≥ {{ start }}m｜停止 &lt; {{ stop }}m｜跌倒確認 {{ confirm }}s｜靈敏度 {{ sens }}｜正前避障 {{ avoid }}mm<br/>
       UWB/Motor: {{ uwb }}｜手勢鎖定: {{ gesture }}｜{{ version }}
     </p>
   </main>
   <script>
+    const AVOID = {{ avoid }};
     let holdTimer = null;
     let following = false;
+
+    function renderTof(val, age) {
+      const root = document.getElementById('tofGrid');
+      if (!root) return;
+      const v = (val === null || val === undefined) ? 8190 : Number(val);
+      const danger = v < AVOID;
+      const pct = Math.max(0, Math.min(100, (v / 1000) * 100));
+      root.innerHTML = '<div class="tof' + (danger ? ' danger' : '') + '">' +
+        '<div class="l">正前</div><div class="v">' + v + '</div>' +
+        '<div class="meter"><span style="width:' + pct + '%"></span></div></div>';
+      const ageEl = document.getElementById('tofAge');
+      if (ageEl) {
+        const a = Number(age);
+        ageEl.textContent = 'ToF age: ' + (Number.isFinite(a) ? a.toFixed(2) : '--') +
+          's' + (a > 1 ? ' (stale)' : '');
+      }
+    }
 
     async function api(path, method='GET', body=null) {
       const opt = { method };
@@ -1295,6 +1394,7 @@ INDEX_HTML = """
             's (' + (uwbStale ? '逾時 stale' : '正常') + ')';
         }
 
+        renderTof(j.tof_mm, j.tof_age);
 
         let fallLine = j.fall_status || '';
         if (j.fall_suspect_elapsed > 0 && j.fall_suspect_elapsed < j.fall_confirm_seconds) {
@@ -1348,6 +1448,7 @@ def index():
       stop=STOP_DIST,
       confirm=fall.FALL_CONFIRM_SECONDS,
       sens=fall.FALL_SENSITIVITY,
+      avoid=AVOID_MM,
       uwb=UWB_SERIAL_PORT,
       gesture='ON' if ENABLE_GESTURE_LOCK else 'OFF',
       version=APP_VERSION,
@@ -1481,6 +1582,7 @@ def status():
   with state_lock:
     dist = latest_distance
     age = time.time() - last_distance_time if last_distance_time else 999.0
+    tof_age = time.time() - last_tof_time if last_tof_time else 999.0
     return jsonify(
         {
             'following': is_following,
@@ -1495,7 +1597,11 @@ def status():
             'distance': dist,
             'distance_age': age,
             'uwb_stale_seconds': UWB_STALE_SECONDS,
-            'vl53_enabled': False,
+            'vl53_enabled': True,
+            'tof_mm': latest_tof_mm,
+            'tof_age': tof_age,
+            'tof_label': TOF_LABEL,
+            'avoid_mm': AVOID_MM,
             'recovery': follow_recovery_note,
             'search_exhausted': search_exhausted,
             'person_seen': person_seen,
@@ -1516,7 +1622,7 @@ if __name__ == '__main__':
   print(f'=== APP_VERSION={APP_VERSION} ===', flush=True)
   print(f'=== FILE={Path(__file__).resolve()} ===', flush=True)
   print(f'=== FALL_SENSITIVITY={fall.FALL_SENSITIVITY:g} ===', flush=True)
-  print(f'=== TRACKER={TRACKER_CFG} VL53=disabled ===', flush=True)
+  print(f'=== TRACKER={TRACKER_CFG} VL53=front-only AVOID_MM={AVOID_MM} ===', flush=True)
   uwb_reader.start()
   motor.open()
   print('=== STARTING CONTROL THREAD ===', flush=True)

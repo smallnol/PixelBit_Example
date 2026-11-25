@@ -1,26 +1,37 @@
 /*
- * UNO R3 + BMP73T104｜Pi-slave 馬達（無 VL53）
+ * UNO R3 + BMP73T104 + 1×VL53L0X（正前）｜Pi-slave 馬達 + 前方避障
  *
- * ※ 2026-11-25：VL53L0X 避障暫拆，本韌體只執行 F/L/R/Z/S/X。
- *   舊版（含 4×VL53）見同目錄註解與 DEPLOY.md「VL53 已停用」說明。
+ * ※ 2026-11-25：改為僅 1 顆正前 VL53（不再用左前／右前／正後）。
  *
  * 接線：
  *   ESP32 GPIO17 (TX2) → UNO D10（SoftwareSerial RX，收 F/L/R/Z/S/X）
- *   UNO D11 (SoftSerial TX) → ESP32 GPIO16（保留；目前不送 O:）
+ *   UNO D11 (SoftSerial TX) → ESP32 GPIO16（回傳 O:mm）
  *   GND 共地
  *
- * 庫：BMP73T104、SoftwareSerial
+ * VL53L0X 正前：
+ *   VCC→UNO 5V、GND→GND、SDA→A4、SCL→A5
+ *   XSHUT→D3（建議接；不接也可，多數模組板內建上拉）
+ *   預設 I2C 位址 0x29（單顆不必改址）
+ *
+ * 庫：Wire、BMP73T104、SoftwareSerial、Pololu VL53L0X
  * USB 監看：115200
  */
+#include <Wire.h>
 #include <BMP73T104.h>
 #include <SoftwareSerial.h>
+#include <VL53L0X.h>
 #include <ctype.h>
 
 SoftwareSerial piSerial(10, 11); // RX=D10 <- ESP32 TX；TX=D11 -> ESP32 RX
 
 const unsigned long CMD_TIMEOUT_MS = 1200;
 const unsigned long CMD_REFRESH_MS = 250;
+const unsigned long TOF_TELEM_MS = 200;
 const unsigned long SOFT_RAMP_MS = 40;
+
+const uint16_t AVOID_MM = 250;
+const uint16_t TOF_FAIL_MM = 8190;
+const uint8_t XSHUT_PIN = 3;  // 正前
 
 const int BASE_FORWARD_SPEED = 85;
 const int BASE_TURN_SPEED = 60;
@@ -56,6 +67,7 @@ char requestedCmd = CMD_STOP;
 char activeCmd = CMD_STOP;
 unsigned long lastCmdTime = 0;
 unsigned long lastApplyTime = 0;
+unsigned long lastTelemTime = 0;
 unsigned long lastRampTime = 0;
 
 int curLeft = 0;
@@ -63,6 +75,10 @@ int curRight = 0;
 int tgtLeft = 0;
 int tgtRight = 0;
 bool emergencyHold = false;
+
+VL53L0X tof;
+uint16_t tofMm = TOF_FAIL_MM;
+bool tofOk = false;
 
 void setSingleMotorSafe(BMP73T104 &motor, int rawSpeed, float trim, int dir) {
   int targetSpeed = constrain((int)(rawSpeed * trim * dir), -100, 100);
@@ -194,6 +210,38 @@ bool isValidCmd(char c) {
          c == CMD_SPIN || c == CMD_STOP || c == CMD_BRAKE;
 }
 
+uint16_t readTofMm() {
+  if (!tofOk) return TOF_FAIL_MM;
+  uint16_t mm = tof.readRangeSingleMillimeters();
+  if (tof.timeoutOccurred() || mm == 0) return TOF_FAIL_MM;
+  if (mm > TOF_FAIL_MM) mm = TOF_FAIL_MM;
+  return mm;
+}
+
+void pollTof() {
+  tofMm = readTofMm();
+}
+
+void sendTofTelemetry() {
+  // O:正前mm（單顆）
+  piSerial.print(F("O:"));
+  piSerial.println(tofMm);
+  Serial.print(F("O:"));
+  Serial.println(tofMm);
+}
+
+char applyObstacleOverride(char cmd) {
+  if (cmd == CMD_BRAKE) return CMD_BRAKE;
+  // 僅前進時用正前距離避障；L/R/Z 不覆寫（單顆無側／後）
+  if (cmd != CMD_FORWARD) return cmd;
+  if (!tofOk) return cmd;
+  if (tofMm < AVOID_MM) {
+    Serial.println(F("AVOID: front blocked -> S"));
+    return CMD_STOP;
+  }
+  return CMD_FORWARD;
+}
+
 void pollPiCommands() {
   static char buf[16];
   static uint8_t idx = 0;
@@ -218,15 +266,20 @@ void pollPiCommands() {
       lastCmdTime = millis();
       requestedCmd = cmd;
 
-      bool force = (cmd != activeCmd) || (cmd == CMD_BRAKE);
-      setActiveCommand(cmd, force);
+      char execCmd = applyObstacleOverride(cmd);
+      bool force = (execCmd != activeCmd) || (cmd == CMD_BRAKE);
+      setActiveCommand(execCmd, force);
 
       static char lastLogReq = 0;
-      if (cmd != lastLogReq || cmd == CMD_BRAKE) {
-        Serial.print(F("CMD="));
+      static char lastLogExec = 0;
+      if (cmd != lastLogReq || execCmd != lastLogExec || cmd == CMD_BRAKE) {
+        Serial.print(F("CMD req="));
         Serial.write(cmd);
+        Serial.print(F(" exec="));
+        Serial.write(execCmd);
         Serial.println();
         lastLogReq = cmd;
+        lastLogExec = execCmd;
       }
     } else if (idx < sizeof(buf) - 1) {
       buf[idx++] = c;
@@ -236,11 +289,47 @@ void pollPiCommands() {
   }
 }
 
+bool initFrontTof() {
+  pinMode(XSHUT_PIN, OUTPUT);
+  digitalWrite(XSHUT_PIN, LOW);
+  delay(50);
+  digitalWrite(XSHUT_PIN, HIGH);
+  delay(80);
+
+  tof.setTimeout(500);
+  if (!tof.init()) {
+    Serial.println(F("VL53 front init FAIL"));
+    digitalWrite(XSHUT_PIN, LOW);
+    tofOk = false;
+    return false;
+  }
+
+  uint16_t probe = 65535;
+  for (uint8_t t = 0; t < 3; t++) {
+    probe = tof.readRangeSingleMillimeters();
+    if (!tof.timeoutOccurred() && probe > 0 && probe < 8000) break;
+    delay(30);
+  }
+  Serial.print(F("VL53 front OK addr=0x29 probe="));
+  Serial.print(probe);
+  Serial.println(F(" mm"));
+  tofOk = true;
+  return true;
+}
+
 void setup() {
   Serial.begin(115200);
   delay(400);
 
-  Serial.println(F("=== UNO Pi-slave 馬達（VL53 已停用）==="));
+  Wire.begin();
+  Wire.setClock(100000);
+  delay(100);
+
+  Serial.println(F("=== UNO Pi-slave + 1xVL53 正前 ==="));
+  if (!initFrontTof()) {
+    Serial.println(F("警告：正前 VL53 失敗，避障停用（馬達仍可用）"));
+  }
+
   piSerial.begin(9600);
   delay(50);
 
@@ -255,13 +344,26 @@ void setup() {
   requestedCmd = CMD_STOP;
   lastCmdTime = millis();
 
-  Serial.println(F("命令 F/L/R/Z/S/X｜無 O: 遙測｜無避障覆寫"));
+  Serial.println(F("命令 F/L/R/Z/S/X｜O:正前mm｜AVOID 250mm｜僅 F 避障"));
 }
 
 void loop() {
   static unsigned long lastFaultClear = 0;
 
   pollPiCommands();
+  pollTof();
+
+  if (!emergencyHold && requestedCmd == CMD_FORWARD) {
+    char execCmd = applyObstacleOverride(requestedCmd);
+    if (execCmd != activeCmd) {
+      setActiveCommand(execCmd, true);
+    }
+  }
+
+  if (millis() - lastTelemTime >= TOF_TELEM_MS) {
+    lastTelemTime = millis();
+    sendTofTelemetry();
+  }
 
   if (activeCmd != CMD_STOP && activeCmd != CMD_BRAKE &&
       (millis() - lastCmdTime > CMD_TIMEOUT_MS)) {

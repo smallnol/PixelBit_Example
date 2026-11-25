@@ -1,13 +1,13 @@
 # 智慧陪伴小車專題說明書  
 ## 跌倒偵測 × 視覺／UWB 跟隨（整合版）
 
-> **※ 2026-11-25 註解：VL53L0X 近距避障已全部從程式／韌體拔除。**  
-> 現況僅視覺 + UWB；無 `O:`／無 ToF 儀表／無底層雷射覆寫。詳見 `DEPLOY.md`、`FOLLOW_SCENARIOS.md`。
+> **※ 2026-11-25：改為僅 1×VL53L0X 正前避障**（左前／右前／正後已拔除）。  
+> 詳見 `DEPLOY.md`、`FOLLOW_SCENARIOS.md`。
 
 > 文件用途：給其他聊天／組員寫專題報告、口頭報告、海報說明用的完整背景與技術說明。  
 > 對應程式：GitHub `smallnol/PixelBit_Example` → 目錄 `14_Fall_Follow_Car/`  
 > 整合 PR：https://github.com/smallnol/PixelBit_Example/pull/4  
-> 分支：`cursor/remove-vl53-1509`（基底 `cursor/fall-follow-combine-1509`）  
+> 分支：`cursor/vl53-front-only-1509`  
 > 最後同步跌倒核心來源：`cursor/fall-detection-line-media-5500`
 
 ---
@@ -49,7 +49,7 @@
 
 - **暫不含 MaUWB AOA**（角度／定位融合尚未接入；目前方向靠相機，距離靠 DS-TWR 類 UWB）。
 - **非醫療級跌倒診斷**：屬原型／展示系統，不宣稱取代穿戴式醫療警報或護理站設備。
-- **VL53 近距避障已停用**（2026-11-25）；尚無下視防墜／AOA。舊 4×VL53 接線見 `DEPLOY.md` 附錄。
+- **VL53 僅正前 1 顆**（2026-11-25）；尚無側／後／下視／AOA。
 - 馬達驅動器（如 BMP73T104）有硬體過流保護（OCP）；劇烈原地轉向仍可能觸發，屬硬體限制，需用軟體弧線轉向與機構調校緩解。
 
 ---
