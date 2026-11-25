@@ -72,9 +72,9 @@
                 │ USB: F/L/R/Z/S/X 命令 ◄──────┘
                 │
      GPIO17 → UNO D10（命令）
-     GPIO16 ← UNO D11（保留；VL53/O: 已停用）
+     GPIO16 ← UNO D11（O: 正前 mm）
                 ▼
-         Arduino UNO（馬達；VL53 已停用）
+         Arduino UNO（馬達 + 1×正前 VL53）
                 │ I2C
                 ▼
          BMP73T104 / 四輪馬達
@@ -105,7 +105,7 @@
 韌體位置：
 
 - 車上 UWB Responder：`14_Fall_Follow_Car/firmware/uwb_car_responder/`（`D:` + 轉發命令 + 橋接 `O:`）
-- UNO：`14_Fall_Follow_Car/firmware/uno_car/`（純馬達；`uno_car_vl53/` 已停用僅參考）
+- UNO：`14_Fall_Follow_Car/firmware/uno_car/`（馬達 + 1×正前 VL53）
 - 身上 Tag：`uwb-follow-car` → `uwb_tag_initiator/`（沿用）
 - 腳位總表：`FEATURES_PINOUT.txt`；部署：`DEPLOY.md`
 
@@ -270,13 +270,13 @@ LINE 官方訊息**不能直接塞本機檔案**，必須是伺服器可抓的 *
 
 邏輯電：3S 18650 → DC → XY3606（≈5.1V）→ USB-C → Pi 5
 馬達電：獨立電池 → BMP73T104（勿灌 UNO 5V）；兩電池只共地
-VL53×4：【已停用】舊腳位 XSHUT D2～D5；見 DEPLOY 附錄
+VL53×1 正前：VCC/GND/SDA/SCL；XSHUT 不接；O:mm
 ```
 
 注意：
 
 - 拔掉錯誤接到 Pi 腳位直接當馬達 UART 的杜邦線（若曾試驗過）。
-- D11→GPIO16 可留；目前不送 O:／網頁無 ToF。
+- **必接 D11→GPIO16**，否則網頁看不到正前 ToF。
 
 ### 6.3 馬達命令語意（UNO Pi-slave）
 
@@ -355,9 +355,9 @@ python3 fall_follow_car.py
 
 ## 八加、進階整合（特定人鎖定 × 網頁儀表板；VL53 已停用）
 
-1. **~~4×VL53L0X~~（已停用 2026-11-25）**：原 UNO 底層避障與 `O:` 遙測已拔除；見 `firmware/uno_car/`。
+1. **1×VL53L0X 正前**：UNO／Pi 前進過近則停；見 `firmware/uno_car/`。
 2. **ByteTrack + HSV Re-ID**：鎖定單一目標後，跟隨與跌倒只看該人；路人灰框 `IGNORED`。
-3. **網頁擴充**：鎖定／解除、手動遙控（跟隨 ON 互鎖）、UWB 儀表板、跌倒警報橫幅（無 ToF）。
+3. **網頁擴充**：鎖定／解除、手動遙控（跟隨 ON 互鎖）、UWB／正前 ToF、跌倒警報橫幅。
 
 ## 九、風險、限制與未來工作
 
@@ -365,7 +365,7 @@ python3 fall_follow_car.py
 
 - 單相機視野外無法視覺跟隨；依賴 `Z` 搜尋。
 - 光線、遮擋仍影響追蹤；HSV Re-ID 在相似衣著多人時可能誤綁。
-- UWB 受環境影響；stale 機制寧可停。（ToF／VL53 已停用）
+- UWB／正前 ToF 受環境影響；stale 機制寧可停。
 - SoftSerial 雙向需額外接 **UNO D11→ESP32 GPIO16**。
 - 圖床第三方服務可能間歇失敗；備援鏈降低但無法保證 100%。
 - 非醫療認證；展示與課程用途為主。
@@ -391,7 +391,7 @@ python3 fall_follow_car.py
 | 跌倒單模組 | `12_Fall_Detection/` |
 | 跟隨單模組 | `13_Vision_UWB_Follow/` |
 
-主程式版本字串：`fall-follow-2026-11-25-no-vl53`。
+主程式版本字串：`fall-follow-2026-11-25-vl53-front`。
 
 ---
 
