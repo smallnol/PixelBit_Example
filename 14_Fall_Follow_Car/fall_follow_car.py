@@ -27,7 +27,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / '.env')
 import line_media as fall  # noqa: E402
 
-APP_VERSION = 'fall-follow-2026-11-25-ui-line'
+APP_VERSION = 'fall-follow-2026-11-26-hsv-verify'
 
 # --- 硬體 / 網路 ---
 CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
@@ -75,6 +75,8 @@ GESTURE_LOCK_SECONDS = float(os.getenv('GESTURE_LOCK_SECONDS', '2.0'))
 HSV_REID_THRESHOLD = float(os.getenv('HSV_REID_THRESHOLD', '0.60'))
 # 目標遺失搜尋中提高 Re-ID 門檻，降低誤跟路人
 HSV_REID_SEARCH = float(os.getenv('HSV_REID_SEARCH', '0.72'))
+# track_id 命中時仍做外觀驗證；低於此視為 ID 被對調（交叉／遮擋）
+HSV_ID_VERIFY = float(os.getenv('HSV_ID_VERIFY', '0.45'))
 LOST_GRACE_SECONDS = float(os.getenv('LOST_GRACE_SECONDS', '1.0'))
 SEARCH_BIAS_SECONDS = float(os.getenv('SEARCH_BIAS_SECONDS', '3.0'))
 Z_TIMEOUT_SECONDS = float(os.getenv('Z_TIMEOUT_SECONDS', '12.0'))
@@ -536,27 +538,54 @@ def resolve_locked_target(people: list[dict], frame: np.ndarray) -> tuple[dict |
   if locked_target_id is None:
     return None, note if note != 'unlocked' else 'unlocked'
 
-  # 直接命中 track_id
+  # track_id 命中：仍用 HSV 驗證，避免交叉／繞背時 ByteTrack 對調 ID
+  id_hit = None
   for p in people:
     if p['track_id'] == locked_target_id:
-      if p['hist'] is not None:
-        locked_target_hist = p['hist']
-      return p, f'locked id={locked_target_id}'
+      id_hit = p
+      break
 
-  # ByteTrack 換 ID → HSV 重連（搜尋中用更高門檻，避免誤跟路人）
+  if id_hit is not None:
+    if locked_target_hist is None:
+      if id_hit['hist'] is not None:
+        locked_target_hist = id_hit['hist']
+      return id_hit, f'locked id={locked_target_id}'
+
+    sim = hist_similarity(locked_target_hist, id_hit['hist'])
+    if sim < 0:
+      # 缺直方圖：暫信 ID，但不更新外觀
+      return id_hit, f'locked id={locked_target_id} (no hist)'
+
+    if sim >= HSV_ID_VERIFY:
+      # 外觀一致才更新模板，避免被路人污染
+      if id_hit['hist'] is not None and sim >= HSV_REID_THRESHOLD:
+        locked_target_hist = id_hit['hist']
+      return id_hit, f'locked id={locked_target_id}'
+
+    print(
+        f'⚠️ ID={locked_target_id} 外觀不符 '
+        f'(sim={sim:.2f} < {HSV_ID_VERIFY:.2f}) → 疑似對調，改 HSV 搜尋',
+        flush=True,
+    )
+    # 不 return：落入下方 Re-ID（也不用錯人更新 hist）
+
+  # ID 消失或外觀不符 → HSV 重連（搜尋中門檻較嚴）
   if locked_target_hist is not None and people:
     thr = HSV_REID_SEARCH if target_lost_since is not None else HSV_REID_THRESHOLD
     scored = []
     for p in people:
+      if p['track_id'] is None:
+        continue
       sim = hist_similarity(locked_target_hist, p['hist'])
-      if p['track_id'] is not None and sim >= thr:
+      if sim >= thr:
         scored.append((sim, p))
     if scored:
       scored.sort(key=lambda x: x[0], reverse=True)
       best_sim, best_p = scored[0]
       old = locked_target_id
       locked_target_id = best_p['track_id']
-      locked_target_hist = best_p['hist']
+      if best_p['hist'] is not None:
+        locked_target_hist = best_p['hist']
       print(
           f'🔁 HSV Re-ID: {old} → {locked_target_id} '
           f'(sim={best_sim:.2f}, thr={thr:.2f})',
