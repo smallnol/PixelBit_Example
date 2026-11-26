@@ -763,26 +763,25 @@ def _avg_point(
   return a or b
 
 
-def analyze_pose(result) -> tuple[bool, bool, bool, float, float, float] | None:
+def analyze_pose_xywh_kpts(
+    cx: float,
+    cy: float,
+    w: float,
+    h: float,
+    keypoints,
+) -> tuple[bool, bool, bool, float, float, float] | None:
   """
+  對單一人物的框 + 關鍵點做跌倒判定。
   回傳 (is_fall, lateral, frontal, aspect_ratio, torso_height, avg_shoulder_y)。
 
   目標：
   - 桌前坐姿／低頭打字 → 不報
   - 蹲下、半倒、躺平 → 依 FALL_SENSITIVITY 可報（預設偏敏感）
   """
-  if len(result.boxes) == 0 or result.keypoints is None or len(result.keypoints.data) == 0:
-    return None
-
-  box = result.boxes.xywh[0]
-  cx, cy = float(box[0]), float(box[1])
-  w, h = float(box[2]), float(box[3])
   if h <= 1e-6:
     return None
   aspect_ratio = round(w / h, 2)
   sens = FALL_SENSITIVITY
-
-  keypoints = result.keypoints.data[0]
   # COCO: 0鼻 5/6肩 9/10腕 11/12髖 13/14膝
   nose = _kp_xy(keypoints, 0)
   l_sh = _kp_xy(keypoints, 5)
@@ -860,4 +859,21 @@ def analyze_pose(result) -> tuple[bool, bool, bool, float, float, float] | None:
       torso_height,
       avg_shoulder_y,
   )
+
+
+def analyze_pose(
+    result, index: int = 0
+) -> tuple[bool, bool, bool, float, float, float] | None:
+  """對 result 中第 index 個人做跌倒判定（預設 0＝最大／第一個）。"""
+  if result.boxes is None or len(result.boxes) == 0:
+    return None
+  if result.keypoints is None or len(result.keypoints.data) == 0:
+    return None
+  if index < 0 or index >= len(result.boxes) or index >= len(result.keypoints.data):
+    return None
+
+  box = result.boxes.xywh[index]
+  cx, cy = float(box[0]), float(box[1])
+  w, h = float(box[2]), float(box[3])
+  return analyze_pose_xywh_kpts(cx, cy, w, h, result.keypoints.data[index])
 
