@@ -35,10 +35,11 @@ const uint16_t TOF_FAIL_MM = 8190;
 // 改完請重燒 UNO；再尺量一次微調
 const int16_t TOF_OFFSET_MM = -22;
 
-// 前進維持；轉向／自轉提高扭力（舊差速 60/20 在地毯常轉不動）
+// 前進維持；L/R 用中等差速（舊 60/20 太弱、反向 85 太猛會把人轉出畫面）
 const int BASE_FORWARD_SPEED = 85;
-const int BASE_TURN_SPEED = 85;   // L/R 近原地轉向單側轉速
-const int BASE_SPIN_SPEED = 80;   // Z 搜尋自轉
+const int BASE_TURN_SPEED = 78;   // L/R 外側
+const int BASE_TURN_INNER = 32;   // L/R 內側（兩輪同向，緩修方位）
+const int BASE_SPIN_SPEED = 68;   // Z 遺失搜尋才原地自轉
 const unsigned int MOTOR_CMD_GAP_US = 4000;
 
 BMP73T104 myM1(2, DCMotor); // 左後
@@ -129,14 +130,14 @@ void cmdToTargets(char cmd, int &L, int &R) {
       L = BASE_FORWARD_SPEED;
       R = BASE_FORWARD_SPEED;
       break;
-    // L/R：左右輪反向 → 近原地轉向（差速緩轉在負載下幾乎轉不動）
+    // L/R：差速緩轉（跟隨修方位）；大力原地轉留給 Z
     case CMD_LEFT:
-      L = -BASE_TURN_SPEED;
+      L = BASE_TURN_INNER;
       R = BASE_TURN_SPEED;
       break;
     case CMD_RIGHT:
       L = BASE_TURN_SPEED;
-      R = -BASE_TURN_SPEED;
+      R = BASE_TURN_INNER;
       break;
     case CMD_SPIN:
       L = -BASE_SPIN_SPEED;
@@ -162,10 +163,11 @@ void softApplyTargets(bool force) {
   if (!force && (now - lastRampTime < SOFT_RAMP_MS)) return;
   lastRampTime = now;
 
-  // 轉向／自轉加快爬升，避免短按或找人時還在爬坡就停
   int step = 18;
-  if (activeCmd == CMD_LEFT || activeCmd == CMD_RIGHT || activeCmd == CMD_SPIN) {
-    step = 28;
+  if (activeCmd == CMD_LEFT || activeCmd == CMD_RIGHT) {
+    step = 16;  // 跟隨微調別太衝
+  } else if (activeCmd == CMD_SPIN) {
+    step = 24;  // 搜尋自轉仍要爬得上
   }
   if ((curLeft > 0 && tgtLeft < 0) || (curLeft < 0 && tgtLeft > 0)) {
     tgtLeft = 0;

@@ -27,7 +27,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / '.env')
 import line_media as fall  # noqa: E402
 
-APP_VERSION = 'fall-follow-2026-11-26-hsv-verify'
+APP_VERSION = 'fall-follow-2026-11-26-turn-mid'
 
 # --- 硬體 / 網路 ---
 CAMERA_INDEX = int(os.getenv('CAMERA_INDEX', '0'))
@@ -61,7 +61,8 @@ MOTOR_VIA_UWB = MOTOR_SERIAL_PORT == UWB_SERIAL_PORT
 # --- 跟隨參數 ---
 START_DIST = float(os.getenv('START_DIST', '2.0'))
 STOP_DIST = float(os.getenv('STOP_DIST', '1.8'))
-CENTER_DEADZONE = float(os.getenv('CENTER_DEADZONE', '0.12'))
+# 略加大死區：人在畫面中央附近優先走 UWB 前進，避免微偏就大力 L/R 轉丟
+CENTER_DEADZONE = float(os.getenv('CENTER_DEADZONE', '0.18'))
 UWB_STALE_SECONDS = float(os.getenv('UWB_STALE_SECONDS', '1.0'))
 TOF_STALE_SECONDS = float(os.getenv('TOF_STALE_SECONDS', '1.0'))
 CMD_INTERVAL_SECONDS = float(os.getenv('CMD_INTERVAL_SECONDS', '0.15'))

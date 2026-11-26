@@ -298,7 +298,7 @@ VL53×1 正前：VCC/GND/SDA/SCL；XSHUT 不接；O:mm
 |------|----------|------|
 | `UWB_SERIAL_PORT` / `MOTOR_SERIAL_PORT` | `/dev/ttyUSB0` | 距離與命令（可同一口） |
 | `START_DIST` / `STOP_DIST` | 2.0 / 1.8 m | 跟隨距離門檻 |
-| `CENTER_DEADZONE` | 0.12 | 置中寬度；太小會左右晃 |
+| `CENTER_DEADZONE` | 0.18 | 置中寬度；太小會左右晃、易轉丟目標 |
 | `FALL_SENSITIVITY` | 1.45 | 跌倒／蹲下靈敏度 |
 | `ROLLING_BUFFER_SECONDS` | 30 | 前情緩衝長度 |
 | `STOP_FOLLOW_ON_FALL` | 1 | 確認跌倒後是否關跟隨 |
